@@ -419,6 +419,24 @@ class TestMilestoneLifecycle:
         phase_complete(tmp_path, "1")
         phase_complete(tmp_path, "2")
 
+        (tmp_path / ".gpd" / "v1.0-MILESTONE-AUDIT.md").write_text(
+            textwrap.dedent(
+                """\
+                ---
+                milestone: "v1.0"
+                audited: "2026-02-23"
+                status: "open_questions"
+                ---
+                # Milestone Audit
+
+                ## Verdict
+
+                Milestone `v1.0` closes coherently.
+                """
+            ),
+            encoding="utf-8",
+        )
+
         # Complete milestone
         result = milestone_complete(tmp_path, "v1.0", name="Core Framework")
         assert result.version == "v1.0"
@@ -435,6 +453,8 @@ class TestMilestoneLifecycle:
         # Archive should have ROADMAP copy
         archive = tmp_path / ".gpd" / "milestones" / "v1.0-ROADMAP.md"
         assert archive.exists()
+        assert (tmp_path / "milestone-checkpoints" / "v1.0.md").exists()
+        assert (tmp_path / "CHECKPOINTS.md").exists()
 
     def test_milestone_incomplete_raises(self, tmp_path: Path) -> None:
         """Cannot complete milestone with incomplete phases."""

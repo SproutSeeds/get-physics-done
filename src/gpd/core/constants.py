@@ -29,6 +29,7 @@ __all__ = [
     "ENV_MAX_INCLUDE_CHARS",
     "ENV_PATTERNS_ROOT",
     "LITERATURE_DIR_NAME",
+    "MILESTONE_CHECKPOINTS_DIR_NAME",
     "MILESTONES_DIR_NAME",
     "MILESTONES_FILENAME",
     "MIN_PYTHON_MAJOR",
@@ -123,6 +124,9 @@ PHASES_DIR_NAME = "phases"
 
 PHASE_CHECKPOINTS_DIR_NAME = "phase-checkpoints"
 """Root-level generated checkpoint shelf with one document per phase."""
+
+MILESTONE_CHECKPOINTS_DIR_NAME = "milestone-checkpoints"
+"""Root-level generated checkpoint shelf with one document per archived milestone."""
 
 ANALYSIS_DIR_NAME = "analysis"
 """Subdirectory under .gpd/ for internal analysis/provenance reports."""
@@ -416,6 +420,10 @@ class ProjectLayout:
         return self.root / PHASE_CHECKPOINTS_DIR_NAME
 
     @property
+    def milestone_checkpoints_dir(self) -> Path:
+        return self.root / MILESTONE_CHECKPOINTS_DIR_NAME
+
+    @property
     def analysis_dir(self) -> Path:
         return self.gpd / ANALYSIS_DIR_NAME
 
@@ -477,6 +485,10 @@ class ProjectLayout:
     def phase_checkpoint_file(self, phase_name: str) -> Path:
         """Return the generated checkpoint note path for a phase directory."""
         return self.phase_checkpoints_dir / f"{phase_name}.md"
+
+    def milestone_checkpoint_file(self, version: str) -> Path:
+        """Return the generated checkpoint note path for an archived milestone."""
+        return self.milestone_checkpoints_dir / f"{version}.md"
 
     def trace_file(self, phase: str, plan: str) -> Path:
         """Return path to a trace JSONL file for a given phase+plan."""

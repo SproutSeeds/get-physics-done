@@ -2116,7 +2116,7 @@ def state_update_progress(cwd: Path) -> UpdateProgressResult:
                 checkpoints_result = sync_phase_checkpoints(cwd)
                 checkpoint_files = checkpoints_result.updated_files
             except Exception:
-                logger.warning("Failed to generate phase checkpoint documents", exc_info=True)
+                logger.warning("Failed to generate checkpoint documents", exc_info=True)
                 checkpoint_files = []
             return UpdateProgressResult(
                 updated=True,

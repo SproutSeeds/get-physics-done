@@ -1,14 +1,17 @@
-"""Generated human-facing phase checkpoint documents.
+"""Generated human-facing checkpoint documents.
 
 Builds a root-facing reading layer from the canonical per-phase SUMMARY and
-VERIFICATION artifacts. The generated outputs are deterministic:
+VERIFICATION artifacts plus archived milestone audit and digest artifacts. The
+generated outputs are deterministic:
 
 - one ``phase-checkpoints/<phase-dir>.md`` file per phase that has summaries
+- one ``milestone-checkpoints/<version>.md`` file per archived milestone
 - one root ``CHECKPOINTS.md`` index covering the whole project
 
 The canonical source of truth remains ``.gpd/phases/.../*-SUMMARY.md`` and
-``*-VERIFICATION.md``. This module only derives readable checkpoint notes from
-those artifacts.
+``*-VERIFICATION.md`` for phases plus ``.gpd/milestones/...`` audit and digest
+artifacts for milestones. This module only derives readable checkpoint notes
+from those artifacts.
 """
 
 from __future__ import annotations
@@ -46,7 +49,9 @@ class SyncPhaseCheckpointsResult(BaseModel):
 
     generated: bool
     phase_count: int
+    milestone_count: int
     checkpoint_dir: str
+    milestone_checkpoint_dir: str
     root_index: str
     updated_files: list[str] = Field(default_factory=list)
     removed_files: list[str] = Field(default_factory=list)
@@ -65,6 +70,49 @@ class _PhaseSummaryDoc:
     summary_extract: SummaryExtractResult
 
 
+@dataclass(frozen=True)
+class _MilestoneRow:
+    version: str
+    name: str
+    status: str
+    started: str
+    completed: str
+    notes: str
+
+
+@dataclass(frozen=True)
+class _MilestoneAuditDoc:
+    path: Path
+    version: str
+    audited: str
+    status: str
+    milestone_question: str
+    verdict_body: str
+    open_questions: list[str]
+    body: str
+
+
+@dataclass(frozen=True)
+class _MilestoneDigestDoc:
+    path: Path
+    narrative_arc: str
+    key_results: list[str]
+    body: str
+
+
+@dataclass(frozen=True)
+class _MilestoneDoc:
+    version: str
+    name: str
+    status: str
+    completed: str
+    notes: str
+    audit: _MilestoneAuditDoc
+    digest: _MilestoneDigestDoc | None
+    roadmap_path: Path | None
+    requirements_path: Path | None
+
+
 def _title_from_phase_dir(phase_dir_name: str) -> tuple[str, str]:
     prefix, _, slug = phase_dir_name.partition("-")
     title = " ".join(part.capitalize() for part in slug.split("-") if part)
@@ -81,6 +129,24 @@ def _clean_sentence(text: str) -> str:
     return value
 
 
+def _clean_clause(text: str) -> str:
+    value = " ".join(text.strip().split())
+    value = re.sub(r"^Status:\s*`[^`]+`\s*", "", value)
+    value = re.sub(r"^Open:\s*", "", value)
+    value = value.strip().strip('"').strip("'")
+    value = value.rstrip(".!?")
+    return value
+
+
+def _ensure_leading_capital(text: str) -> str:
+    value = text.lstrip()
+    if not value:
+        return ""
+    if value[0].isalpha():
+        return value[0].upper() + value[1:]
+    return value
+
+
 def _natural_join(items: list[str]) -> str:
     cleaned = [_clean_sentence(item) for item in items if _clean_sentence(item)]
     if not cleaned:
@@ -90,6 +156,18 @@ def _natural_join(items: list[str]) -> str:
     if len(cleaned) == 2:
         return f"{cleaned[0]} {cleaned[1]}"
     return " ".join(cleaned)
+
+
+def _summarize_phrases(items: list[str], *, limit: int = 3) -> str:
+    cleaned = [_clean_clause(item) for item in items if _clean_clause(item)]
+    if not cleaned:
+        return ""
+    trimmed = cleaned[:limit]
+    if len(trimmed) == 1:
+        return trimmed[0]
+    if len(trimmed) == 2:
+        return f"{trimmed[0]} and {trimmed[1]}"
+    return f"{', '.join(trimmed[:-1])}, and {trimmed[-1]}"
 
 
 def _prefixed_summary(prefix: str, items: list[str], *, limit: int = 3) -> str:
@@ -307,24 +385,278 @@ def _render_phase_checkpoint(cwd: Path, phase_dir: Path, docs: list[_PhaseSummar
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _render_root_index(cwd: Path, grouped: list[tuple[Path, list[_PhaseSummaryDoc]]]) -> str:
+def _parse_markdown_sections(body: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    matches = list(re.finditer(r"(?m)^## (.+)$", body))
+    for index, match in enumerate(matches):
+        title = match.group(1).strip()
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        sections[title] = body[start:end].strip()
+    return sections
+
+
+def _parse_milestones_table(layout: ProjectLayout) -> dict[str, _MilestoneRow]:
+    rows: dict[str, _MilestoneRow] = {}
+    content = safe_read_file(layout.milestones_md)
+    if not content:
+        return rows
+    for line in content.splitlines():
+        if not line.startswith("| `v"):
+            continue
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) < 6:
+            continue
+        version = parts[0].strip("`")
+        rows[version] = _MilestoneRow(
+            version=version,
+            name=parts[1],
+            status=parts[2],
+            started=parts[3],
+            completed=parts[4],
+            notes=parts[5],
+        )
+    return rows
+
+
+def _milestone_sort_key(version: str) -> tuple[int, ...]:
+    numeric = version.lstrip("vV")
+    return tuple(int(part) for part in numeric.split("."))
+
+
+def _parse_milestone_audit(cwd: Path, path: Path) -> _MilestoneAuditDoc:
+    content = safe_read_file(path)
+    if content is None:
+        raise ValueError(f"Failed to read {path.relative_to(cwd)}")
+    try:
+        frontmatter, body = extract_frontmatter(content)
+    except FrontmatterParseError:
+        frontmatter = {}
+        body = content
+
+    stripped_body = _strip_top_heading(body)
+    sections = _parse_markdown_sections(stripped_body)
+    open_questions: list[str] = []
+    raw_open = frontmatter.get("open_questions")
+    if isinstance(raw_open, list):
+        for item in raw_open:
+            if isinstance(item, dict):
+                values = item.get("items")
+                if isinstance(values, list):
+                    open_questions.extend(str(value) for value in values)
+            elif isinstance(item, str):
+                open_questions.append(item)
+
+    version = str(frontmatter.get("milestone") or path.stem.replace("-MILESTONE-AUDIT", "")).strip()
+    return _MilestoneAuditDoc(
+        path=path,
+        version=version,
+        audited=str(frontmatter.get("audited") or "").strip(),
+        status=str(frontmatter.get("status") or "").strip(),
+        milestone_question=sections.get("Milestone Question", ""),
+        verdict_body=sections.get("Verdict", ""),
+        open_questions=open_questions,
+        body=stripped_body,
+    )
+
+
+def _parse_milestone_digest(cwd: Path, path: Path) -> _MilestoneDigestDoc:
+    content = safe_read_file(path)
+    if content is None:
+        raise ValueError(f"Failed to read {path.relative_to(cwd)}")
+    stripped_body = _strip_top_heading(content)
+    sections = _parse_markdown_sections(stripped_body)
+    key_results: list[str] = []
+    key_result_section = sections.get("Key Results", "")
+    for line in key_result_section.splitlines():
+        if not line.startswith("|"):
+            continue
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) >= 2 and parts[0] not in {"Phase", "-----"}:
+            key_results.append(parts[1])
+    return _MilestoneDigestDoc(
+        path=path,
+        narrative_arc=sections.get("Narrative Arc", ""),
+        key_results=key_results,
+        body=stripped_body,
+    )
+
+
+def _milestone_audit_paths(layout: ProjectLayout) -> list[Path]:
+    audit_paths: dict[str, Path] = {}
+    if layout.milestones_dir.is_dir():
+        for path in layout.milestones_dir.glob("v*-MILESTONE-AUDIT.md"):
+            audit_paths[path.stem.replace("-MILESTONE-AUDIT", "")] = path
+    if layout.gpd.is_dir():
+        for path in layout.gpd.glob("v*-MILESTONE-AUDIT.md"):
+            version = path.stem.replace("-MILESTONE-AUDIT", "")
+            audit_paths.setdefault(version, path)
+    return [audit_paths[version] for version in sorted(audit_paths, key=_milestone_sort_key)]
+
+
+def _load_milestone_docs(cwd: Path) -> list[_MilestoneDoc]:
+    layout = ProjectLayout(cwd)
+    milestone_rows = _parse_milestones_table(layout)
+    docs: list[_MilestoneDoc] = []
+
+    for audit_path in _milestone_audit_paths(layout):
+        audit = _parse_milestone_audit(cwd, audit_path)
+        row = milestone_rows.get(
+            audit.version,
+            _MilestoneRow(version=audit.version, name=audit.version, status="", started="", completed="", notes=""),
+        )
+        digest_path = layout.milestones_dir / audit.version / "RESEARCH-DIGEST.md"
+        roadmap_path = layout.milestones_dir / f"{audit.version}-ROADMAP.md"
+        requirements_path = layout.milestones_dir / f"{audit.version}-REQUIREMENTS.md"
+        docs.append(
+            _MilestoneDoc(
+                version=audit.version,
+                name=row.name or audit.version,
+                status=audit.status or row.status,
+                completed=row.completed if row.completed and row.completed != "—" else "",
+                notes=row.notes,
+                audit=audit,
+                digest=_parse_milestone_digest(cwd, digest_path) if digest_path.exists() else None,
+                roadmap_path=roadmap_path if roadmap_path.exists() else None,
+                requirements_path=requirements_path if requirements_path.exists() else None,
+            )
+        )
+
+    return docs
+
+
+def _milestone_headline(doc: _MilestoneDoc) -> str:
+    if doc.digest and doc.digest.narrative_arc:
+        return _clean_sentence(doc.digest.narrative_arc.split(". ", 1)[0].strip())
+
+    paragraphs = [paragraph.strip() for paragraph in doc.audit.verdict_body.split("\n\n") if paragraph.strip()]
+    for paragraph in paragraphs:
+        cleaned = _clean_clause(paragraph)
+        if cleaned:
+            return _clean_sentence(cleaned)
+
+    return _clean_sentence(doc.notes or f"{doc.version} closed with audit status {doc.status}.")
+
+
+def _render_milestone_story_paragraphs(doc: _MilestoneDoc) -> list[str]:
+    paragraphs: list[str] = []
+    intro = f"Milestone {doc.version} focused on {doc.name.lower()}."
+    if doc.completed:
+        intro += f" It closed on {doc.completed}."
+    if doc.status:
+        intro += f" The audit status was `{doc.status}`."
+    headline = _milestone_headline(doc)
+    if headline:
+        intro += f" The headline result was straightforward: {headline}"
+    paragraphs.append(intro)
+
+    key_results = _summarize_phrases(doc.digest.key_results if doc.digest else [], limit=4)
+    if key_results:
+        paragraphs.append(f"The main milestone decisions were concrete. {_clean_sentence(key_results)}")
+
+    artifact_bits: list[str] = []
+    if doc.roadmap_path:
+        artifact_bits.append("archived roadmap")
+    if doc.requirements_path:
+        artifact_bits.append("archived requirements")
+    artifact_bits.append("archived audit")
+    if doc.digest:
+        artifact_bits.append("research digest")
+    artifact_summary = _summarize_phrases(artifact_bits, limit=4)
+    if artifact_summary:
+        paragraphs.append(_clean_sentence(f"In practical terms, this milestone now gives the project {artifact_summary}"))
+
+    open_questions = _summarize_phrases(doc.audit.open_questions, limit=3)
+    if open_questions:
+        paragraphs.append(
+            f"What remains open is still bounded. {_clean_sentence(_ensure_leading_capital(open_questions))}"
+        )
+    elif doc.notes:
+        paragraphs.append(_clean_sentence(doc.notes))
+
+    return [paragraph for paragraph in paragraphs if paragraph]
+
+
+def _render_milestone_checkpoint(cwd: Path, doc: _MilestoneDoc) -> str:
+    checkpoint_dir = ProjectLayout(cwd).milestone_checkpoints_dir
+    lines: list[str] = [
+        _GENERATED_HEADER,
+        "",
+        f"# Milestone {doc.version} Checkpoint",
+        "",
+        f"_Title: {doc.name}_",
+    ]
+    if doc.completed:
+        lines.append(f"_Completed: {doc.completed}_")
+    if doc.status:
+        lines.append(f"_Audit status: {doc.status}_")
+    lines.append("")
+
+    for paragraph in _render_milestone_story_paragraphs(doc):
+        lines.append(paragraph)
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Read This Milestone",
+            "",
+            f"- Audit: [{doc.audit.path.name}]({os.path.relpath(doc.audit.path, checkpoint_dir)})",
+        ]
+    )
+    if doc.digest:
+        lines.append(f"- Research digest: [{doc.digest.path.name}]({os.path.relpath(doc.digest.path, checkpoint_dir)})")
+    if doc.roadmap_path:
+        lines.append(f"- Archived roadmap: [{doc.roadmap_path.name}]({os.path.relpath(doc.roadmap_path, checkpoint_dir)})")
+    if doc.requirements_path:
+        lines.append(
+            f"- Archived requirements: [{doc.requirements_path.name}]({os.path.relpath(doc.requirements_path, checkpoint_dir)})"
+        )
+    lines.append("")
+
+    if doc.digest:
+        lines.extend(["## Research Digest", "", doc.digest.body, ""])
+
+    lines.extend(["## Audit Notes", "", doc.audit.body, ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_milestone_index_entry(layout: ProjectLayout, doc: _MilestoneDoc) -> str:
+    line = f"- [Milestone {doc.version}: {doc.name}]({layout.milestone_checkpoint_file(doc.version).relative_to(layout.root).as_posix()})"
+    headline = _milestone_headline(doc)
+    if headline:
+        line += f" — {headline}"
+    return line
+
+
+def _render_root_index(
+    cwd: Path,
+    phase_groups: list[tuple[Path, list[_PhaseSummaryDoc]]],
+    milestone_docs: list[_MilestoneDoc],
+) -> str:
     lines = [
         _GENERATED_HEADER,
         "",
-        "# Phase Checkpoints",
+        "# Checkpoints",
         "",
         "This is the human-facing checkpoint shelf for the project.",
-        "Each phase note is generated from the canonical SUMMARY and VERIFICATION artifacts under `.gpd/phases/`.",
+        "Phase notes are generated from the canonical SUMMARY and VERIFICATION artifacts under `.gpd/phases/`.",
+        "Milestone notes are generated from archived audit and digest artifacts under `.gpd/milestones/`.",
         "",
-        "Read one checkpoint file when you want the end-of-phase story in plain English.",
-        "Use the linked summary and verification artifacts when you want the full underlying record.",
-        "",
-        "## Phase Index",
+        "Read one checkpoint file when you want the end-of-cycle story in plain English.",
+        "Use the linked summary, verification, audit, and digest artifacts when you want the full underlying record.",
         "",
     ]
 
     layout = ProjectLayout(cwd)
-    for phase_dir, docs in grouped:
+
+    if milestone_docs:
+        lines.extend(["## Milestone Index", ""])
+        for doc in milestone_docs:
+            lines.append(_render_milestone_index_entry(layout, doc))
+        lines.append("")
+
+    lines.extend(["## Phase Index", ""])
+    for phase_dir, docs in phase_groups:
         latest = docs[-1]
         link = layout.phase_checkpoint_file(phase_dir.name).relative_to(cwd).as_posix()
         line = f"- [Phase {latest.phase_number}: {latest.phase_title}]({link})"
@@ -346,11 +678,13 @@ def _write_if_changed(path: Path, content: str) -> bool:
 
 @instrument_gpd_function("checkpoints.sync_phase_checkpoints")
 def sync_phase_checkpoints(cwd: Path) -> SyncPhaseCheckpointsResult:
-    """Generate the root-facing checkpoint shelf from phase summaries."""
+    """Generate the root-facing checkpoint shelf from phase and milestone artifacts."""
     layout = ProjectLayout(cwd)
     layout.phase_checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    layout.milestone_checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    grouped: list[tuple[Path, list[_PhaseSummaryDoc]]] = []
+    phase_groups: list[tuple[Path, list[_PhaseSummaryDoc]]] = []
+    milestone_docs = _load_milestone_docs(cwd)
     updated_files: list[str] = []
     removed_files: list[str] = []
 
@@ -362,36 +696,52 @@ def sync_phase_checkpoints(cwd: Path) -> SyncPhaseCheckpointsResult:
             docs = _phase_summary_docs(cwd, phase_dir)
             if not docs:
                 continue
-            grouped.append((phase_dir, docs))
+            phase_groups.append((phase_dir, docs))
             checkpoint_path = layout.phase_checkpoint_file(phase_dir.name)
             content = _render_phase_checkpoint(cwd, phase_dir, docs)
             if _write_if_changed(checkpoint_path, content):
                 updated_files.append(checkpoint_path.relative_to(cwd).as_posix())
 
+    for doc in milestone_docs:
+        checkpoint_path = layout.milestone_checkpoint_file(doc.version)
+        content = _render_milestone_checkpoint(cwd, doc)
+        if _write_if_changed(checkpoint_path, content):
+            updated_files.append(checkpoint_path.relative_to(cwd).as_posix())
+
     expected_checkpoint_paths = {
         layout.phase_checkpoint_file(phase_dir.name).resolve()
-        for phase_dir, _docs in grouped
+        for phase_dir, _docs in phase_groups
     }
     for existing in sorted(
-        [
-            path
-            for path in layout.phase_checkpoints_dir.glob("*.md")
-            if not path.name.startswith("._")
-        ]
+        [path for path in layout.phase_checkpoints_dir.glob("*.md") if not path.name.startswith("._")]
     ):
         if existing.resolve() in expected_checkpoint_paths:
             continue
         existing.unlink()
         removed_files.append(existing.relative_to(cwd).as_posix())
 
-    root_content = _render_root_index(cwd, grouped)
+    expected_milestone_paths = {
+        layout.milestone_checkpoint_file(doc.version).resolve()
+        for doc in milestone_docs
+    }
+    for existing in sorted(
+        [path for path in layout.milestone_checkpoints_dir.glob("*.md") if not path.name.startswith("._")]
+    ):
+        if existing.resolve() in expected_milestone_paths:
+            continue
+        existing.unlink()
+        removed_files.append(existing.relative_to(cwd).as_posix())
+
+    root_content = _render_root_index(cwd, phase_groups, milestone_docs)
     if _write_if_changed(layout.checkpoints_md, root_content):
         updated_files.append(layout.checkpoints_md.relative_to(cwd).as_posix())
 
     return SyncPhaseCheckpointsResult(
         generated=True,
-        phase_count=len(grouped),
+        phase_count=len(phase_groups),
+        milestone_count=len(milestone_docs),
         checkpoint_dir=layout.phase_checkpoints_dir.relative_to(cwd).as_posix(),
+        milestone_checkpoint_dir=layout.milestone_checkpoints_dir.relative_to(cwd).as_posix(),
         root_index=layout.checkpoints_md.relative_to(cwd).as_posix(),
         updated_files=updated_files,
         removed_files=removed_files,

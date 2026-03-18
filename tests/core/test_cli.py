@@ -1106,7 +1106,9 @@ def test_sync_phase_checkpoints_subcommand(mock_sync):
     mock_result.model_dump.return_value = {
         "generated": True,
         "phase_count": 1,
+        "milestone_count": 0,
         "checkpoint_dir": "phase-checkpoints",
+        "milestone_checkpoint_dir": "milestone-checkpoints",
         "root_index": "CHECKPOINTS.md",
         "updated_files": ["phase-checkpoints/01-test-phase.md", "CHECKPOINTS.md"],
         "removed_files": [],
