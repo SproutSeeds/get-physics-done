@@ -21,6 +21,7 @@ Public surface:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from urllib.parse import quote
 
@@ -46,11 +47,23 @@ OPENALEX_ARXIV_SOURCE_ID = "S4306400194"
 # Kept short and stable so a fine-tuned prompt-injection guard can pattern-match.
 EXTERNAL_CONTENT_PREFIX = "[EXTERNAL CONTENT] "
 
-_USER_AGENT = (
-    f"gpd-arxiv-bridge/{GPD_VERSION} "
-    "(+https://github.com/psi-oss/get-physics-done; mailto:ops@psi.inc)"
-)
+_USER_AGENT = f"gpd-arxiv-bridge/{GPD_VERSION} (+https://github.com/SproutSeeds/get-physics-done)"
 _HEADERS = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
+
+# OpenAlex meters requests. Without a key, every request counts against a
+# small free daily budget shared by all clients on the caller's IP address
+# (observed 2026-09-29: $0.10 per day, $0.001 per search, $0.0001 per filter
+# lookup), and exhausted budgets return HTTP 429 until midnight UTC. A free
+# personal key has its own budget: https://help.openalex.org/api/authentication/
+OPENALEX_API_KEY_ENV = "OPENALEX_API_KEY"
+
+
+def _request_headers() -> dict[str, str]:
+    headers = dict(_HEADERS)
+    key = os.environ.get(OPENALEX_API_KEY_ENV, "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 _TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 # Recognise arxiv IDs anywhere inside an OpenAlex Work record (pdf_url,
@@ -228,7 +241,7 @@ def _http_get(
     """
     url = f"{_OPENALEX_BASE}{path}"
     try:
-        resp = httpx.get(url, params=params, headers=_HEADERS, timeout=_TIMEOUT)
+        resp = httpx.get(url, params=params, headers=_request_headers(), timeout=_TIMEOUT)
     except httpx.RequestError as exc:
         logger.info("OpenAlex request error on %s: %s", path, exc)
         return 0, None, str(exc)
@@ -241,16 +254,36 @@ def _http_get(
     return resp.status_code, body, resp.text
 
 
+_BOOLEAN_OR_GROUPED = re.compile(r'["()]|\b(?:AND|OR|NOT)\b')
+
+
+def phrase_form(query: str) -> str | None:
+    """Quoted form of a plain multi-word query, or ``None``.
+
+    OpenAlex's free-text ``search`` matches the words loosely, so a specialised
+    phrase such as ``neural network field theory`` returns generic machine
+    learning papers. Queries that already carry quotes, parentheses or boolean
+    operators are left as written.
+    """
+    if len(query.split()) < 2 or _BOOLEAN_OR_GROUPED.search(query):
+        return None
+    return f'"{query}"'
+
+
 def openalex_search(args: dict[str, object]) -> dict[str, object]:
     """Search OpenAlex and return upstream-shaped ``{papers, total_results}``.
 
     Recognised ``args``: ``query`` (str, required) and ``max_results`` (int,
     1-200, default 10). Other keys are ignored — callers must translate
     arxiv-style filters before passing them through.
+
+    A plain multi-word query is searched as a quoted phrase first; the loose
+    word query then fills any remaining slots, without duplicates.
     """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
         return {"papers": [], "total_results": 0}
+    query = query.strip()
 
     raw_max = args.get("max_results", 10)
     try:
@@ -258,30 +291,42 @@ def openalex_search(args: dict[str, object]) -> dict[str, object]:
     except (TypeError, ValueError):
         per_page = 10
 
-    params: dict[str, object] = {
-        "search": query.strip(),
-        "per-page": per_page,
-        # Restrict to works whose primary venue is arXiv (Cornell). Using the
-        # canonical source id verified live against the OpenAlex sources
-        # endpoint — see `OPENALEX_ARXIV_SOURCE_ID` above for the rationale
-        # and the production-incident history that motivated this constant.
-        "filter": f"primary_location.source.id:{OPENALEX_ARXIV_SOURCE_ID}",
-    }
-
-    status, body, _ = _http_get("/works", params)
-    # Only retry without the filter when OpenAlex rejects the filter itself
-    # (400 Bad Request / 422 Unprocessable). For 429, 5xx, timeouts, or parse
-    # failures, the filter is not the problem — retrying doubles upstream load
-    # without improving the outcome, which violates the rate-limit-resilient
-    # contract this translator is built around.
-    if status in {400, 422}:
-        params.pop("filter", None)
+    phrase = phrase_form(query)
+    papers: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for search in (phrase, query) if phrase else (query,):
+        params: dict[str, object] = {
+            "search": search,
+            "per-page": per_page,
+            # Any location on arXiv, not only the primary one: OpenAlex merges
+            # arXiv preprints into canonical works whose primary location is
+            # often the journal version, so a primary-location filter drops
+            # most published papers. The source id is verified live, see
+            # `OPENALEX_ARXIV_SOURCE_ID` above.
+            "filter": f"locations.source.id:{OPENALEX_ARXIV_SOURCE_ID}",
+        }
         status, body, _ = _http_get("/works", params)
+        # Only retry without the filter when OpenAlex rejects the filter itself
+        # (400 Bad Request / 422 Unprocessable). For 429, 5xx, timeouts, or parse
+        # failures, the filter is not the problem — retrying doubles upstream load
+        # without improving the outcome, which violates the rate-limit-resilient
+        # contract this translator is built around.
+        if status in {400, 422}:
+            params.pop("filter", None)
+            status, body, _ = _http_get("/works", params)
+        if status == 429:
+            break  # budget exhausted; the bridge falls back to arXiv
+        if status != 200 or body is None:
+            continue
+        for paper in openalex_results_to_papers(body):
+            paper_id = paper.get("id")
+            if isinstance(paper_id, str) and paper_id not in seen:
+                seen.add(paper_id)
+                papers.append(paper)
+        if len(papers) >= per_page:
+            break
 
-    if status != 200 or body is None:
-        return {"papers": [], "total_results": 0}
-
-    papers = openalex_results_to_papers(body)
+    papers = papers[:per_page]
     return {"papers": papers, "total_results": len(papers)}
 
 
@@ -361,6 +406,7 @@ def _abstract_error(paper_id: str, message: str) -> dict[str, object]:
 
 __all__ = [
     "EXTERNAL_CONTENT_PREFIX",
+    "phrase_form",
     "gcs_fetch_pdf",
     "openalex_abstract",
     "openalex_results_to_papers",

@@ -65,7 +65,7 @@ def test_build_source_download_url_normalizes_first() -> None:
 
 def test_arxiv_source_user_agent_tracks_package_version() -> None:
     assert arxiv_source_user_agent() == (
-        f"get-physics-done/{resolve_active_version()} (https://github.com/psi-oss/get-physics-done)"
+        f"get-physics-done/{resolve_active_version()} (https://github.com/SproutSeeds/get-physics-done)"
     )
 
 

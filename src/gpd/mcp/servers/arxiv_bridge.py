@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from collections import deque
@@ -55,6 +56,11 @@ _DOWNLOAD_SOURCE_TOOL_ANNOTATIONS = mutating_tool_annotations(
     idempotent=False,
     open_world=True,
 )
+
+# arXiv query syntax that only export.arxiv.org understands: field prefixes
+# (ti:, au:, abs:, co:, jr:, cat:, rn:, id:, all:) and ANDNOT. The search
+# tool's own description teaches this syntax to the model.
+_ARXIV_ONLY_QUERY_SYNTAX = re.compile(r"(?<![\w.])(?:ti|au|abs|co|jr|cat|rn|id|all):|\bANDNOT\b")
 
 _BACKEND_ENV = "GPD_ARXIV_BACKEND"
 _BACKEND_DEFAULT = "hybrid"
@@ -262,7 +268,12 @@ class ArxivBridge:
             openalex_result = await self._try_openalex_search(args)
             if openalex_result is not None:
                 return openalex_result
-            return await self._call_throttled(name, args)
+            if _plain_phrase(args) is None:
+                return await self._call_throttled(name, args)
+            papers, raw = await self._arxiv_phrase_search(args)
+            if papers is None:
+                return raw
+            return _papers_result(papers)
 
         if name == "get_abstract":
             queried_id = args.get("paper_id") if isinstance(args.get("paper_id"), str) else ""
@@ -342,6 +353,11 @@ class ArxivBridge:
         sort_by = args.get("sort_by")
         if isinstance(sort_by, str) and sort_by.strip() and sort_by.strip().lower() != "relevance":
             return None
+        # OpenAlex would read arXiv field prefixes as plain words and still
+        # return loosely matching papers, so those queries go to arXiv.
+        query = args.get("query")
+        if isinstance(query, str) and _ARXIV_ONLY_QUERY_SYNTAX.search(query):
+            return None
         try:
             body = await asyncio.to_thread(arxiv_translators.openalex_search, args)
         except Exception:
@@ -352,6 +368,10 @@ class ArxivBridge:
         papers = body.get("papers")
         if not isinstance(papers, list) or not papers:
             return None
+        requested = _requested_count(args)
+        if len(papers) < max(1, requested // 2):
+            papers = await self._supplement_from_arxiv(args, papers, requested)
+            body = {"papers": papers, "total_results": len(papers)}
         first = papers[0] if isinstance(papers[0], dict) else {}
         first_title = first.get("title") if isinstance(first.get("title"), str) else ""
         first_authors = first.get("authors") if isinstance(first.get("authors"), list) else []
@@ -368,6 +388,53 @@ class ArxivBridge:
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=header + json.dumps(body))],
         )
+
+    async def _supplement_from_arxiv(
+        self, args: dict[str, object], papers: list[object], requested: int
+    ) -> list[object]:
+        """Top up a thin OpenAlex result with arXiv's own search.
+
+        A specialised physics phrase often matches only a handful of OpenAlex
+        works, while arXiv's index is complete and current. One throttled
+        upstream call fills the remaining slots; OpenAlex results keep their
+        order and duplicates (by version-stripped id) are dropped. Any
+        upstream failure leaves the OpenAlex list unchanged.
+        """
+        try:
+            if _plain_phrase(args) is None:
+                extra = _papers_of(await self._call_throttled("search_papers", args))
+            else:
+                extra, _ = await self._arxiv_phrase_search(args)
+        except Exception:
+            logger.exception("arXiv supplement for a thin OpenAlex result failed")
+            return papers
+        return _merge_papers(papers, extra or [], requested)
+
+    async def _arxiv_phrase_search(
+        self, args: dict[str, object]
+    ) -> tuple[list[object] | None, types.CallToolResult]:
+        """arXiv search for a plain multi-word query, exact phrase first.
+
+        arXiv, like OpenAlex, matches the words of an unquoted query loosely,
+        so ``neural network field theory`` returns generic neural-network
+        papers. The quoted phrase goes first; when it fills fewer than half the
+        requested slots, the words joined by AND fill the rest. Returns
+        ``(papers, raw)``; ``papers`` is ``None`` when the first call failed,
+        and ``raw`` is that call's result so the caller can pass it through.
+        """
+        query = args.get("query")
+        phrase = _plain_phrase(args)
+        assert isinstance(query, str) and phrase is not None
+        requested = _requested_count(args)
+        raw = await self._call_throttled("search_papers", {**args, "query": phrase})
+        papers = _papers_of(raw)
+        if papers is None:
+            return None, raw
+        if len(papers) < max(1, requested // 2):
+            terms = " AND ".join(query.split())
+            more = _papers_of(await self._call_throttled("search_papers", {**args, "query": terms}))
+            papers = _merge_papers(papers, more or [], requested)
+        return papers, raw
 
     async def _try_openalex_abstract(
         self, args: dict[str, object]
@@ -421,13 +488,17 @@ class ArxivBridge:
             except OSError as exc:
                 logger.warning("cache read failed %s: %s", cache_path, exc)
             else:
-                return _content_envelope(
-                    "cache",
-                    "Paper already available (returned from cache)",
-                    paper_id,
-                    content,
-                    cache_path,
-                )
+                if _arxiv_ar5iv.is_conversion_failure(content):
+                    # An older bridge cached ar5iv's failed-conversion page.
+                    logger.info("ignoring cached conversion failure for %s", paper_id)
+                else:
+                    return _content_envelope(
+                        "cache",
+                        "Paper already available (returned from cache)",
+                        paper_id,
+                        content,
+                        cache_path,
+                    )
 
         html = await asyncio.to_thread(_arxiv_ar5iv.fetch_html_content, paper_id)
         if html is not None:
@@ -507,6 +578,9 @@ class ArxivBridge:
         except OSError as exc:
             logger.warning("read_paper cache read failed %s: %s", cache_path, exc)
             return None
+        if _arxiv_ar5iv.is_conversion_failure(content):
+            # A cached failed-conversion page is not the paper: fetch it again.
+            return await self._intercept_download(args)
         return _content_envelope(
             "cache", "Paper read from local cache", paper_id, content, cache_path
         )
@@ -804,6 +878,63 @@ def _tool_error(message: str) -> types.CallToolResult:
         content=[types.TextContent(type="text", text=f"Error: {message}")],
         structuredContent={"schema_version": 1, "error": message},
     )
+
+
+def _plain_phrase(args: dict[str, object]) -> str | None:
+    """Quoted form of a plain multi-word query, or ``None`` for queries that
+    already carry quotes, parentheses, boolean operators or arXiv field
+    syntax (those are sent as written)."""
+    query = args.get("query")
+    if not isinstance(query, str) or _ARXIV_ONLY_QUERY_SYNTAX.search(query):
+        return None
+    return arxiv_translators.phrase_form(query.strip())
+
+
+def _papers_of(result: types.CallToolResult) -> list[object] | None:
+    """The ``papers`` list of a successful upstream search result, else None."""
+    if not _is_success(result):
+        return None
+    payload = _first_text_payload(result)
+    try:
+        parsed = json.loads(payload) if payload else None
+    except (TypeError, ValueError):
+        return None
+    papers = parsed.get("papers") if isinstance(parsed, dict) else None
+    return papers if isinstance(papers, list) else None
+
+
+def _merge_papers(first: list[object], extra: list[object], limit: int) -> list[object]:
+    """``first`` in order, then unseen ``extra`` papers, by version-stripped id."""
+    merged = list(first)
+    seen = {_paper_key(paper) for paper in first}
+    for paper in extra:
+        key = _paper_key(paper)
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(paper)
+    return merged[:limit]
+
+
+def _papers_result(papers: list[object]) -> types.CallToolResult:
+    body = {"total_results": len(papers), "papers": papers}
+    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(body, indent=2))])
+
+
+def _requested_count(args: dict[str, object]) -> int:
+    raw = args.get("max_results", 10)
+    try:
+        return max(1, min(200, int(raw)))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _paper_key(paper: object) -> str | None:
+    if not isinstance(paper, dict):
+        return None
+    paper_id = paper.get("id")
+    if not isinstance(paper_id, str) or not paper_id.strip():
+        return None
+    return re.sub(r"v\d+$", "", paper_id.strip())
 
 
 def _first_text_payload(result: types.CallToolResult) -> str | None:
