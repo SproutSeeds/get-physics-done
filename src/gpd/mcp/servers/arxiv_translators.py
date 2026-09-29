@@ -299,10 +299,9 @@ _BOOLEAN_OR_GROUPED = re.compile(r'["()]|\b(?:AND|OR|NOT)\b')
 def phrase_form(query: str) -> str | None:
     """Quoted form of a plain multi-word query, or ``None``.
 
-    OpenAlex's free-text ``search`` matches the words loosely, so a specialised
-    phrase such as ``neural network field theory`` returns generic machine
-    learning papers. Queries that already carry quotes, parentheses or boolean
-    operators are left as written.
+    Searched loosely, a specialised phrase such as ``neural network field
+    theory`` returns generic machine learning papers. Queries that already
+    carry quotes, parentheses or boolean operators are left as written.
     """
     if len(query.split()) < 2 or _BOOLEAN_OR_GROUPED.search(query):
         return None
@@ -316,8 +315,11 @@ def openalex_search(args: dict[str, object]) -> dict[str, object]:
     1-200, default 10). Other keys are ignored — callers must translate
     arxiv-style filters before passing them through.
 
-    A plain multi-word query is searched as a quoted phrase first; the loose
-    word query then fills any remaining slots, without duplicates.
+    A plain multi-word query is searched as a quoted phrase first; works whose
+    title or abstract contains all of its words then fill any remaining slots,
+    without duplicates. OpenAlex's free-text ``search`` also matches full text,
+    so a loose multi-concept query (``reflection positivity neural networks``)
+    otherwise returns papers that merely mention each word somewhere.
     """
     query = args.get("query")
     if not isinstance(query, str) or not query.strip():
@@ -330,29 +332,36 @@ def openalex_search(args: dict[str, object]) -> dict[str, object]:
     except (TypeError, ValueError):
         per_page = 10
 
+    # Any location on arXiv, not only the primary one: OpenAlex merges arXiv
+    # preprints into canonical works whose primary location is often the
+    # journal version, so a primary-location filter drops most published
+    # papers. The source id is verified live, see `OPENALEX_ARXIV_SOURCE_ID`.
+    on_arxiv = f"locations.source.id:{OPENALEX_ARXIV_SOURCE_ID}"
     phrase = phrase_form(query)
+    if phrase:
+        # Commas separate OpenAlex filters, so they cannot appear in a value.
+        words = " ".join(query.replace(",", " ").split())
+        steps: list[tuple[dict[str, object], dict[str, object]]] = [
+            ({"search": phrase, "filter": on_arxiv}, {"search": phrase}),
+            (
+                {"filter": f"title_and_abstract.search:{words},{on_arxiv}", "sort": "relevance_score:desc"},
+                {"filter": f"title_and_abstract.search:{words}", "sort": "relevance_score:desc"},
+            ),
+        ]
+    else:
+        steps = [({"search": query, "filter": on_arxiv}, {"search": query})]
+
     papers: list[dict[str, object]] = []
     seen: set[str] = set()
-    for search in (phrase, query) if phrase else (query,):
-        params: dict[str, object] = {
-            "search": search,
-            "per-page": per_page,
-            # Any location on arXiv, not only the primary one: OpenAlex merges
-            # arXiv preprints into canonical works whose primary location is
-            # often the journal version, so a primary-location filter drops
-            # most published papers. The source id is verified live, see
-            # `OPENALEX_ARXIV_SOURCE_ID` above.
-            "filter": f"locations.source.id:{OPENALEX_ARXIV_SOURCE_ID}",
-        }
-        status, body, _ = _http_get("/works", params)
-        # Only retry without the filter when OpenAlex rejects the filter itself
-        # (400 Bad Request / 422 Unprocessable). For 429, 5xx, timeouts, or parse
-        # failures, the filter is not the problem — retrying doubles upstream load
-        # without improving the outcome, which violates the rate-limit-resilient
-        # contract this translator is built around.
+    for params, without_arxiv_filter in steps:
+        status, body, _ = _http_get("/works", {**params, "per-page": per_page})
+        # Only retry without the arXiv filter when OpenAlex rejects the filter
+        # itself (400 Bad Request / 422 Unprocessable). For 429, 5xx, timeouts,
+        # or parse failures, the filter is not the problem — retrying doubles
+        # upstream load without improving the outcome, which violates the
+        # rate-limit-resilient contract this translator is built around.
         if status in {400, 422}:
-            params.pop("filter", None)
-            status, body, _ = _http_get("/works", params)
+            status, body, _ = _http_get("/works", {**without_arxiv_filter, "per-page": per_page})
         if status == 429:
             break  # budget exhausted; the bridge falls back to arXiv
         if status != 200 or body is None:

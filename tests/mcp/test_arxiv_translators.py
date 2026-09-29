@@ -304,25 +304,60 @@ def _work(arxiv_id: str) -> dict:
 
 def test_search_uses_any_arxiv_location_and_phrase_first(monkeypatch):
     """A plain multi-word query is searched as a quoted phrase over works with
-    any arXiv location; the loose query then fills the remaining slots without
-    duplicates. No network: fakes the HTTP layer."""
+    any arXiv location; works whose title or abstract holds all its words then
+    fill the remaining slots without duplicates. No network: fakes the HTTP
+    layer."""
     from gpd.mcp.servers import arxiv_translators  # type: ignore
 
     calls = []
 
     def fake_get(path, params=None):
         calls.append(dict(params))
-        if params["search"].startswith('"'):
+        if "search" in params:
             return 200, {"results": [_work("2008.08601")]}, ""
         return 200, {"results": [_work("2008.08601"), _work("2112.04527")]}, ""
 
     monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
     res = arxiv_translators.openalex_search({"query": "neural network field theory", "max_results": 5})
 
+    on_arxiv = f"locations.source.id:{arxiv_translators.OPENALEX_ARXIV_SOURCE_ID}"
     assert [p["id"] for p in res["papers"]] == ["2008.08601", "2112.04527"]
     assert res["total_results"] == 2
-    assert [c["search"] for c in calls] == ['"neural network field theory"', "neural network field theory"]
-    assert all(c["filter"] == f"locations.source.id:{arxiv_translators.OPENALEX_ARXIV_SOURCE_ID}" for c in calls)
+    assert calls == [
+        {"search": '"neural network field theory"', "filter": on_arxiv, "per-page": 5},
+        {
+            "filter": f"title_and_abstract.search:neural network field theory,{on_arxiv}",
+            "sort": "relevance_score:desc",
+            "per-page": 5,
+        },
+    ]
+
+
+def test_search_fill_keeps_commas_out_of_the_filter_and_retries_without_arxiv_filter(monkeypatch):
+    """Commas separate OpenAlex filters; a rejected filter (400) is retried
+    without the arXiv clause, keeping the title-and-abstract search."""
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(dict(params))
+        if "search" in params:
+            return 200, {"results": []}, ""
+        if "locations.source.id" in params["filter"]:
+            return 400, None, "bad filter"
+        return 200, {"results": [_work("2401.12345")]}, ""
+
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_search({"query": "anharmonic oscillator, large N", "max_results": 5})
+
+    assert [p["id"] for p in res["papers"]] == ["2401.12345"]
+    assert calls[1]["filter"].startswith("title_and_abstract.search:anharmonic oscillator large N,")
+    assert calls[2] == {
+        "filter": "title_and_abstract.search:anharmonic oscillator large N",
+        "sort": "relevance_score:desc",
+        "per-page": 5,
+    }
 
 
 @pytest.mark.parametrize("query", ['"reflection positivity"', "sphaleron", "lattice AND QCD", "(a b) c"])
