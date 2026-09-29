@@ -1402,3 +1402,42 @@ async def test_search_papers_arxiv_fallback_passes_errors_through(
     assert len(log) == 1
     assert result.isError is True
     assert "503" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_search_papers_top_up_keeps_frequently_cited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    cited = [{"id": "1411.7041", "title": "Bulk locality", "year": 2014, "cited_by_results": 2,
+              "url": "https://arxiv.org/abs/1411.7041"}]
+    monkeypatch.setattr(
+        arxiv_translators,
+        "openalex_search",
+        lambda args: {"papers": [_paper("1607.03901")], "total_results": 1, "frequently_cited": cited,
+                      "frequently_cited_note": "note"},
+    )
+    upstream = _json.dumps({"total_results": 1, "papers": [_paper("1503.06237v2")]})
+    fake, log = _make_fake_session(call_outputs=[(upstream, False), (upstream, False)])
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("search_papers", {"query": "quantum error correction holography"})
+    finally:
+        bridge._session = None
+
+    text = result.content[0].text
+    body = _json.loads(text[text.index("{"):])
+    assert [p["id"] for p in body["papers"]] == ["1607.03901", "1503.06237v2"]
+    assert body["frequently_cited"] == cited
+    assert body["frequently_cited_note"] == "note"

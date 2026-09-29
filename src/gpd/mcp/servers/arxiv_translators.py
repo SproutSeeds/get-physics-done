@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from functools import lru_cache
 from urllib.parse import quote
 
@@ -352,6 +353,7 @@ def openalex_search(args: dict[str, object]) -> dict[str, object]:
         steps = [({"search": query, "filter": on_arxiv}, {"search": query})]
 
     papers: list[dict[str, object]] = []
+    works: list[dict[str, object]] = []
     seen: set[str] = set()
     for params, without_arxiv_filter in steps:
         status, body, _ = _http_get("/works", {**params, "per-page": per_page})
@@ -366,16 +368,89 @@ def openalex_search(args: dict[str, object]) -> dict[str, object]:
             break  # budget exhausted; the bridge falls back to arXiv
         if status != 200 or body is None:
             continue
-        for paper in openalex_results_to_papers(body):
-            paper_id = paper.get("id")
+        for work in body.get("results") or []:
+            if not isinstance(work, dict):
+                continue
+            paper = _to_paper_record(work)
+            paper_id = paper.get("id") if paper else None
             if isinstance(paper_id, str) and paper_id not in seen:
                 seen.add(paper_id)
                 papers.append(paper)
+                works.append(work)
         if len(papers) >= per_page:
             break
 
     papers = papers[:per_page]
-    return {"papers": papers, "total_results": len(papers)}
+    result: dict[str, object] = {"papers": papers, "total_results": len(papers)}
+    cited = frequently_cited(works[:per_page])
+    if cited:
+        result["frequently_cited"] = cited
+        result["frequently_cited_note"] = FREQUENTLY_CITED_NOTE
+    return result
+
+
+FREQUENTLY_CITED_NOTE = (
+    "Works cited by several of these results; for a topic they are often the foundational "
+    "papers, even when their wording differs from the query."
+)
+
+
+def frequently_cited(
+    works: list[dict[str, object]], *, limit: int = 8, min_shared: int = 2
+) -> list[dict[str, object]]:
+    """The works most often referenced by ``works``, as a short list.
+
+    Keyword search misses canonical papers worded differently from the query
+    (for "quantum error correction holography", the AdS/CFT error-correction
+    papers never say "holography"), yet the results cite them: both were
+    referenced by 9 of the top 10 on 2026-09-29. Counts come from each result's
+    OpenAlex ``referenced_works``; one filter lookup resolves titles and arXiv
+    ids. Works already among the results are skipped. Returns ``[]`` when
+    fewer than three results carry references or the lookup fails.
+    """
+    own = {work.get("id") for work in works}
+    with_refs = [work for work in works if work.get("referenced_works")]
+    if len(with_refs) < 3:
+        return []
+    # dict.fromkeys dedupes each list in order, so ties keep first-seen order.
+    counts = Counter(
+        ref
+        for work in with_refs
+        for ref in dict.fromkeys(work.get("referenced_works") or [])
+        if isinstance(ref, str) and ref not in own
+    )
+    shared = [(ref, n) for ref, n in counts.most_common() if n >= min_shared][:limit]
+    if not shared:
+        return []
+    ids = "|".join(ref.rsplit("/", 1)[-1] for ref, _ in shared)
+    status, body, _ = _http_get(
+        "/works",
+        {
+            "filter": f"openalex:{ids}",
+            "per-page": len(shared),
+            "select": "id,title,publication_year,doi,ids,primary_location,locations",
+        },
+    )
+    if status != 200 or body is None:
+        return []
+    by_id = {work.get("id"): work for work in body.get("results") or [] if isinstance(work, dict)}
+    out: list[dict[str, object]] = []
+    for ref, n in shared:
+        work = by_id.get(ref)
+        if not work:
+            continue
+        arxiv_id = _extract_arxiv_id(work) or ""
+        doi = work.get("doi") if isinstance(work.get("doi"), str) else ""
+        out.append(
+            {
+                "id": arxiv_id,
+                "title": work.get("title") or "",
+                "year": work.get("publication_year") or 0,
+                "cited_by_results": n,
+                "url": f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else (doi or ref),
+            }
+        )
+    return out
 
 
 def _find_arxiv_work(paper_id: str) -> tuple[int, dict[str, object] | None]:

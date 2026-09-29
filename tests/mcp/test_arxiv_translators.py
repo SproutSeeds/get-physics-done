@@ -477,3 +477,72 @@ def test_keychain_is_not_consulted_off_macos(monkeypatch):
         assert arxiv_translators.openalex_api_key() == ""
     finally:
         arxiv_translators._keychain_api_key.cache_clear()
+
+
+def _cited_work(openalex_id: str, arxiv_id: str, refs: list[str]) -> dict:
+    return {
+        "id": f"https://openalex.org/{openalex_id}",
+        "title": f"T {arxiv_id}",
+        "authorships": [],
+        "abstract_inverted_index": {"x": [0]},
+        "locations": [{"landing_page_url": f"http://arxiv.org/abs/{arxiv_id}"}],
+        "publication_date": "2020-01-01",
+        "concepts": [],
+        "referenced_works": [f"https://openalex.org/{r}" for r in refs],
+    }
+
+
+def test_search_adds_frequently_cited_references(monkeypatch):
+    """Works cited by at least two results are listed with how many results
+    cite them; the results themselves are skipped; a work without an arXiv
+    location keeps its DOI. No network: fakes the HTTP layer."""
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    results = [
+        _cited_work("W1", "2001.00001", ["R1", "R2"]),
+        _cited_work("W2", "2001.00002", ["R1", "R3"]),
+        _cited_work("W3", "2001.00003", ["R1", "R2", "W1"]),
+        _cited_work("W4", "2001.00004", ["R2", "W1"]),
+    ]
+    resolved = [
+        {"id": "https://openalex.org/R1", "title": "Bulk locality", "publication_year": 2014,
+         "locations": [{"landing_page_url": "http://arxiv.org/abs/1411.7041"}]},
+        {"id": "https://openalex.org/R2", "title": "Journal only", "publication_year": 1999,
+         "doi": "https://doi.org/10.1000/x", "locations": []},
+    ]
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(dict(params))
+        if "search" in params:
+            return 200, {"results": results}, ""
+        return 200, {"results": resolved}, ""
+
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_search({"query": "sphaleron", "max_results": 10})
+
+    assert [p["id"] for p in res["papers"]] == ["2001.00001", "2001.00002", "2001.00003", "2001.00004"]
+    assert all(set(p) == UPSTREAM_PAPER_KEYS for p in res["papers"])
+    assert res["frequently_cited"] == [
+        {"id": "1411.7041", "title": "Bulk locality", "year": 2014, "cited_by_results": 3,
+         "url": "https://arxiv.org/abs/1411.7041"},
+        {"id": "", "title": "Journal only", "year": 1999, "cited_by_results": 3, "url": "https://doi.org/10.1000/x"},
+    ]
+    assert res["frequently_cited_note"] == arxiv_translators.FREQUENTLY_CITED_NOTE
+    assert calls[1]["filter"] == "openalex:R1|R2"
+
+
+def test_frequently_cited_is_omitted_when_the_lookup_fails(monkeypatch):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    results = [_cited_work(f"W{n}", f"2001.0000{n}", ["R1"]) for n in range(1, 4)]
+
+    def fake_get(path, params=None):
+        if "search" in params:
+            return 200, {"results": results}, ""
+        return 429, {"error": "Rate limit exceeded"}, ""
+
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_search({"query": "sphaleron"})
+    assert len(res["papers"]) == 3
+    assert "frequently_cited" not in res

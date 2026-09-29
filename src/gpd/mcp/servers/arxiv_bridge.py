@@ -371,7 +371,7 @@ class ArxivBridge:
         requested = _requested_count(args)
         if len(papers) < max(1, requested // 2):
             papers = await self._supplement_from_arxiv(args, papers, requested)
-            body = {"papers": papers, "total_results": len(papers)}
+            body = {**body, "papers": papers, "total_results": len(papers)}
         first = papers[0] if isinstance(papers[0], dict) else {}
         first_title = first.get("title") if isinstance(first.get("title"), str) else ""
         first_authors = first.get("authors") if isinstance(first.get("authors"), list) else []
