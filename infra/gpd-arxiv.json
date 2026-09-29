@@ -1,6 +1,6 @@
 {
   "name": "gpd-arxiv",
-  "description": "Optional arXiv bridge for arxiv-mcp-server. Advertises the baseline upstream tools search_papers, download_paper, list_papers, read_paper, get_abstract, forwards only tools exposed by the live upstream server, and adds GPD download_source for raw source archives.",
+  "description": "Optional arXiv bridge for arxiv-mcp-server. Advertises the baseline upstream tools search_papers, download_paper, list_papers, read_paper, get_abstract, forwards only tools exposed by the live upstream server, and adds GPD download_source for raw source archives, recent_papers for verified new arXiv listings and paper_citations for references and citing works.",
   "transport": "stdio",
   "command": "gpd-mcp-arxiv",
   "args": [],
@@ -11,7 +11,9 @@
     "list_papers",
     "read_paper",
     "get_abstract",
-    "download_source"
+    "download_source",
+    "recent_papers",
+    "paper_citations"
   ],
   "registry_prefix": "gpd_arxiv",
   "prerequisites": [
@@ -37,7 +39,9 @@
     "get_abstract"
   ],
   "local_capabilities": [
-    "download_source"
+    "download_source",
+    "recent_papers",
+    "paper_citations"
   ],
   "alternatives": {
     "python_module": {

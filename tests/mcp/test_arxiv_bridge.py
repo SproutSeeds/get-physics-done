@@ -108,13 +108,23 @@ async def test_bridge_advertises_live_upstream_tools_and_adds_local_download_sou
         "read_paper",
         "get_abstract",
         "download_source",
+        "recent_papers",
+        "paper_citations",
     ]
-    assert result.tools[-1].inputSchema["properties"]["paper_id"]["description"].startswith("arXiv paper identifier")
-    assert result.tools[-1].annotations is not None
-    assert result.tools[-1].annotations.readOnlyHint is False
-    assert result.tools[-1].annotations.destructiveHint is True
-    assert result.tools[-1].annotations.idempotentHint is False
-    assert result.tools[-1].annotations.openWorldHint is True
+    download_source = result.tools[-3]
+    assert download_source.inputSchema["properties"]["paper_id"]["description"].startswith("arXiv paper identifier")
+    assert download_source.annotations is not None
+    assert download_source.annotations.readOnlyHint is False
+    assert download_source.annotations.destructiveHint is True
+    assert download_source.annotations.idempotentHint is False
+    assert download_source.annotations.openWorldHint is True
+    for tool in result.tools[-2:]:
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is True
+        assert tool.annotations.openWorldHint is True
+        assert tool.inputSchema["additionalProperties"] is False
+    assert "required" not in result.tools[-2].inputSchema  # query or categories, checked by the tool
+    assert result.tools[-1].inputSchema["required"] == ["paper_id"]
     assert result.nextCursor == "next-page"
 
 
@@ -167,7 +177,7 @@ async def test_bridge_preserves_upstream_pagination_and_only_adds_download_sourc
     finally:
         bridge._session = None
 
-    assert [tool.name for tool in first.tools] == ["list_papers", "download_source"]
+    assert [tool.name for tool in first.tools] == ["list_papers", "download_source", "recent_papers", "paper_citations"]
     assert first.nextCursor == "cursor-2"
     assert [tool.name for tool in second.tools] == ["list_papers"]
     assert second.nextCursor is None
@@ -1441,3 +1451,243 @@ async def test_search_papers_top_up_keeps_frequently_cited(
     assert [p["id"] for p in body["papers"]] == ["1607.03901", "1503.06237v2"]
     assert body["frequently_cited"] == cited
     assert body["frequently_cited_note"] == "note"
+
+
+def _dated_paper(paper_id, title, abstract, published, *, authors=("A. Author",), categories=("hep-th",)):
+    return {"id": paper_id, "title": title, "authors": list(authors), "abstract": "[EXTERNAL CONTENT] " + abstract,
+            "categories": list(categories), "published": published, "url": f"https://arxiv.org/pdf/{paper_id}",
+            "resource_uri": f"arxiv://{paper_id}"}
+
+
+async def _recent(monkeypatch, arguments, outputs, backend="hybrid"):
+    """Run recent_papers against a fake arXiv session; returns (result, calls)."""
+    from gpd.mcp.servers import _arxiv_token_bucket
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    fake, log = _make_fake_session(call_outputs=outputs)
+    bridge = ArxivBridge(ArxivBridgeConfig(backend=backend))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("recent_papers", arguments)
+    finally:
+        bridge._session = None
+    return result, log
+
+
+def _days_ago(days: int, hour: str = "12:00:00") -> str:
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC).date() - timedelta(days=days)).isoformat() + f"T{hour}Z"
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_lists_only_fresh_on_topic_papers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plain query: exact phrase first, then all words. A paper whose first
+    version predates the window and a paper without the topic are dropped and
+    counted; the rest come back newest first with how the topic matched."""
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    phrase_hits = {"total_results": 3, "papers": [
+        _dated_paper("2609.00001", "Neural-network field theories at large N", "We study it.", _days_ago(1)),
+        _dated_paper("2609.00002", "Spin glasses", "Unrelated physics.", _days_ago(1)),
+        _dated_paper("2508.00003", "Neural network field theory revisited", "Old paper, new version.", _days_ago(30)),
+    ]}
+    word_hits = {"total_results": 2, "papers": [
+        _dated_paper("2609.00004", "Fields from networks", "A neural network defines a field theory.", _days_ago(0, "01:00:00")),
+        _dated_paper("2609.00001", "Neural-network field theories at large N", "We study it.", _days_ago(1)),
+    ]}
+    result, log = await _recent(
+        monkeypatch,
+        {"query": "neural network field theory", "days": 7, "max_results": 5},
+        [(_json.dumps(phrase_hits), False), (_json.dumps(word_hits), False)],
+    )
+
+    today = datetime.now(UTC).date()
+    window_start = (today - timedelta(days=7)).isoformat()
+    assert [call[1]["query"] for call in log] == ['"neural network field theory"', "neural AND network AND field AND theory"]
+    for call in log:
+        assert call[1]["date_from"] == window_start
+        assert call[1]["date_to"] == (today + timedelta(days=1)).isoformat()
+        assert call[1]["sort_by"] == "date" and call[1]["max_results"] == 50 and "categories" not in call[1]
+    body = _json.loads(result.content[0].text)
+    assert [(p["id"], p["match"]) for p in body["papers"]] == [
+        ("2609.00004", "all words close together in abstract"),
+        ("2609.00001", "phrase in title"),
+    ]
+    assert (body["checked"], body["dropped_outside_window"], body["dropped_topic_not_found"]) == (4, 1, 1)
+    assert body["dropped_category_mismatch"] == 0
+    assert body["window"] == {"from": window_start, "to": today.isoformat(), "days": 7}
+    assert "incomplete" not in body
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_checks_field_queries_and_categories(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    hits = {"total_results": 3, "papers": [
+        _dated_paper("2609.00005", "Holography", "A field theory result.", _days_ago(0, "01:00:00"),
+                     authors=["James Halverson"], categories=["hep-th", "cs.LG"]),
+        _dated_paper("2609.00006", "Holography", "A field theory result.", _days_ago(1), authors=["Someone Else"]),
+        _dated_paper("2609.00007", "Holography", "A field theory result.", _days_ago(1),
+                     authors=["J. Halverson"], categories=["cond-mat.dis-nn"]),
+    ]}
+    result, log = await _recent(
+        monkeypatch,
+        {"query": 'au:Halverson AND abs:"field theory"', "categories": ["hep-th"]},
+        [(_json.dumps(hits), False)],
+        backend="arxiv-only",
+    )
+    assert len(log) == 1 and log[0][1]["query"] == 'au:Halverson AND abs:"field theory"'
+    assert log[0][1]["categories"] == ["hep-th"]
+    body = _json.loads(result.content[0].text)
+    assert [(p["id"], p["match"]) for p in body["papers"]] == [("2609.00005", "every query field matched")]
+    assert (body["dropped_category_mismatch"], body["dropped_topic_not_found"]) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_lists_categories_without_a_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    hits = {"total_results": 1, "papers": [_dated_paper("2609.00008", "Anything", "Text.", _days_ago(0, "01:00:00"))]}
+    result, log = await _recent(monkeypatch, {"categories": ["hep-th"], "days": 1}, [(_json.dumps(hits), False)])
+    assert len(log) == 1 and log[0][1]["query"] == "" and log[0][1]["categories"] == ["hep-th"]
+    body = _json.loads(result.content[0].text)
+    assert [(p["id"], p["match"]) for p in body["papers"]] == [("2609.00008", "category listing")]
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_keeps_url_breaking_characters_out_of_the_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    empty = _json.dumps({"total_results": 0, "papers": []})
+    result, log = await _recent(monkeypatch, {"query": "B&B #1 decays?"}, [(empty, False), (empty, False)])
+    assert [call[1]["query"] for call in log] == ['"B B 1 decays"', "b AND 1 AND decays"]
+    assert _json.loads(result.content[0].text)["query"] == "B B 1 decays"
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_reports_a_failed_second_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    hits = {"total_results": 1, "papers": [
+        _dated_paper("2609.00009", "Sphaleron rates", "Sphaleron rates at weak coupling.", _days_ago(1))]}
+    result, _ = await _recent(
+        monkeypatch,
+        {"query": "sphaleron rates"},
+        [(_json.dumps(hits), False), ("Error: arXiv API HTTP error - 503", True)],
+    )
+    body = _json.loads(result.content[0].text)
+    assert [p["id"] for p in body["papers"]] == ["2609.00009"]
+    assert "503" in body["incomplete"]
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_surfaces_a_first_search_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, _ = await _recent(monkeypatch, {"query": "sphaleron"}, [("Error: arXiv API HTTP error - 503", True)])
+    assert result.isError is True
+    text = result.content[0].text
+    assert "503" in text and not text.startswith("Error: Error")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments, message",
+    [({"query": ""}, "query, categories"), ({}, "query, categories"), ({"query": "&#"}, "query, categories"),
+     ({"query": "x", "limit": 3}, "unsupported arguments"), ({"query": "x", "categories": "hep-th"}, "categories"),
+     ({"query": 3}, "query must be a string")],
+)
+async def test_recent_papers_rejects_bad_arguments(monkeypatch: pytest.MonkeyPatch, arguments, message) -> None:
+    result, log = await _recent(monkeypatch, arguments, [])
+    assert result.isError is True and message in result.content[0].text
+    assert log == []
+
+
+@pytest.mark.asyncio
+async def test_paper_citations_routes_to_both_sources_and_respects_arxiv_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_citations
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    seen = []
+
+    def fake_citations(args):
+        seen.append(args)
+        if args["paper_id"] == "bad":
+            return {"status": "error", "message": "paper_id must be an arXiv id"}
+        return {"status": "success", "paper_id": "1411.7041", "references": [], "cited_by": []}
+
+    monkeypatch.setattr(_arxiv_citations, "paper_citations", fake_citations)
+    fake, log = _make_fake_session()
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        ok = await bridge.call_tool("paper_citations", {"paper_id": "1411.7041"})
+        bad = await bridge.call_tool("paper_citations", {"paper_id": "bad"})
+    finally:
+        bridge._session = None
+    assert _json.loads(ok.content[0].text)["status"] == "success"
+    assert bad.isError is True and "arXiv id" in bad.content[0].text
+    assert seen == [{"paper_id": "1411.7041"}, {"paper_id": "bad"}] and log == []
+
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="arxiv-only"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        blocked = await bridge.call_tool("paper_citations", {"paper_id": "1411.7041"})
+    finally:
+        bridge._session = None
+    assert blocked.isError is True and "arxiv-only" in blocked.content[0].text
+
+
+def _topic_paper(title, abstract="x", *, authors=("A. Author",), categories=("hep-th",)):
+    return {"title": title, "abstract": "[EXTERNAL CONTENT] " + abstract, "authors": list(authors),
+            "categories": list(categories)}
+
+
+@pytest.mark.parametrize(
+    "query, paper, expected",
+    [
+        ("neural network field theory", _topic_paper("Neural-network field theories"), "phrase in title"),
+        ("neural network field theory", _topic_paper("Fields", "A neural network field theory."), "phrase in abstract"),
+        ("neural network field theory", _topic_paper("Field theory methods for deep neural networks"),
+         "all words in title"),
+        ("neural network field theory", _topic_paper("Networks", "Field theories of neural networks."),
+         "all words close together in abstract"),
+        ("neural network field theory", _topic_paper("Networks", "Field theory from a neural net-work."), None),
+        ("neural network field theory",
+         _topic_paper("LHC review", "Results depend on neural networks. " + "More text here. " * 5 + "Theory and field."),
+         None),
+        ("neural network field theory", _topic_paper("Neural networks", "No fields here."), None),
+        ("Renyi entropy", _topic_paper("R\\'enyi entropies of free fields"), "phrase in title"),
+        ("Rényi entropy", _topic_paper("Renyi entropy bounds"), "phrase in title"),
+        ("N=4 super Yang-Mills", _topic_paper("$\\mathcal{N}=4$ super Yang-Mills amplitudes"), "phrase in title"),
+        ('"reflection positivity"', _topic_paper("Title", "We prove reflection positivity."), "phrase in abstract"),
+        ('"neural network" gaussian', _topic_paper("Neural network limits", "A Gaussian process."), "phrase in title"),
+        ('"neural network" gaussian', _topic_paper("Neural network limits", "No match here."), None),
+        ('"external content"', _topic_paper("Title", "Nothing relevant."), None),
+        ("sphaleron", _topic_paper("Sphalerons on the lattice"), "words in title or abstract"),
+        ("sphaleron", _topic_paper("Instantons"), None),
+        ('ti:"field theory"', _topic_paper("Anything"), None),
+        ('ti:"field theories" AND au:Halverson', _topic_paper("A field theory", authors=["J. Halverson"]),
+         "every query field matched"),
+        ("au:del_maestro AND cat:cond-mat", _topic_paper("x", authors=["Adrian Del Maestro"], categories=["cond-mat.str-el"]),
+         "every query field matched"),
+        ("au:del_maestro AND cat:hep-th", _topic_paper("x", authors=["Adrian Del Maestro"], categories=["cond-mat.str-el"]),
+         None),
+        ('"neural network" AND gaussian', _topic_paper("Gaussian limits", "A neural network."), "every query field matched"),
+        ("ti:neural OR ti:network", _topic_paper("Anything"), "arXiv query syntax, not rechecked"),
+        ('co:"10 pages"', _topic_paper("Anything"), "arXiv query syntax, not rechecked"),
+        ("ti:neural network", _topic_paper("Anything"), "arXiv query syntax, not rechecked"),
+    ],
+)
+def test_topic_match_rules(query, paper, expected) -> None:
+    from gpd.mcp.servers.arxiv_bridge import _topic_match
+
+    assert _topic_match(query, paper) == expected

@@ -41,7 +41,7 @@ It covers:
 - `src/gpd/hooks/*.py`: `11`
 - `src/gpd/mcp/*.py`: `5`
 - `src/gpd/mcp/integrations/*.py`: `2`
-- `src/gpd/mcp/servers/*.py`: `15`
+- `src/gpd/mcp/servers/*.py`: `16`
 - `infra/gpd-*.json`: `8`
 
 Excluded as noise from node counting, but still modeled where contractually relevant:

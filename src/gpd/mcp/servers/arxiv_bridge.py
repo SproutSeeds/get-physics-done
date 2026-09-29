@@ -10,9 +10,11 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import mcp.types as types
@@ -30,11 +32,13 @@ from gpd.core.arxiv_source_download import (
 from gpd.mcp.servers import (
     _arxiv_ar5iv,
     _arxiv_cache,
+    _arxiv_citations,
     _arxiv_gcs,
     _arxiv_retry,
     _arxiv_token_bucket,
     arxiv_translators,
     mutating_tool_annotations,
+    read_only_tool_annotations,
 )
 from gpd.version import __version__ as GPD_VERSION
 
@@ -50,7 +54,10 @@ UPSTREAM_CORE_TOOL_NAMES = (
     "get_abstract",
 )
 DOWNLOAD_SOURCE_TOOL_NAME = "download_source"
-ADVERTISED_TOOL_NAMES = (*UPSTREAM_CORE_TOOL_NAMES, DOWNLOAD_SOURCE_TOOL_NAME)
+RECENT_PAPERS_TOOL_NAME = "recent_papers"
+PAPER_CITATIONS_TOOL_NAME = "paper_citations"
+LOCAL_TOOL_NAMES = (DOWNLOAD_SOURCE_TOOL_NAME, RECENT_PAPERS_TOOL_NAME, PAPER_CITATIONS_TOOL_NAME)
+ADVERTISED_TOOL_NAMES = (*UPSTREAM_CORE_TOOL_NAMES, *LOCAL_TOOL_NAMES)
 _DOWNLOAD_SOURCE_TOOL_ANNOTATIONS = mutating_tool_annotations(
     destructive=True,
     idempotent=False,
@@ -116,6 +123,98 @@ _DOWNLOAD_SOURCE_TOOL = types.Tool(
     inputSchema=_DOWNLOAD_SOURCE_SCHEMA,
     annotations=_DOWNLOAD_SOURCE_TOOL_ANNOTATIONS,
 )
+
+
+_RECENT_PAPERS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": (
+                "Topic: plain words, a quoted phrase, or arXiv search syntax (ti:, au:, abs:, cat:, AND, OR). "
+                "Optional when categories are given."
+            ),
+        },
+        "days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60,
+            "default": 7,
+            "description": "How many days back from today to list.",
+        },
+        "categories": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional arXiv categories, for example [\"hep-th\", \"quant-ph\"].",
+        },
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+    },
+    "additionalProperties": False,
+}
+
+_RECENT_PAPERS_TOOL = types.Tool(
+    name=RECENT_PAPERS_TOOL_NAME,
+    description=(
+        "List the newest arXiv papers on a topic, in categories, or both, newest first, straight from "
+        "arXiv's own listing (search_papers draws on OpenAlex, which adds new papers about five days "
+        "after submission). Every returned paper is checked: its first version was submitted inside "
+        "the window, it carries a requested category, and the topic appears in its title or abstract "
+        "(the phrase, all of its words in the title, or all of them close together in the abstract; "
+        "arXiv field queries joined by AND, such as au:Witten AND ti:holography, are checked field by "
+        "field). Papers that fail a check are dropped and counted, "
+        "and each kept paper says how it matched. Use it to see what is new on a topic or in a field; "
+        "for new work worded differently, list a key paper's newest citing works with paper_citations "
+        "and order=recent."
+    ),
+    inputSchema=_RECENT_PAPERS_SCHEMA,
+    annotations=read_only_tool_annotations(open_world=True),
+)
+
+_PAPER_CITATIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "paper_id": {"type": "string", "description": "arXiv id, for example 1411.7041 or hep-th/9711200."},
+        "direction": {
+            "type": "string",
+            "enum": ["both", "references", "cited_by"],
+            "default": "both",
+            "description": "Works the paper cites, works that cite it, or both.",
+        },
+        "order": {
+            "type": "string",
+            "enum": ["influential", "recent"],
+            "default": "influential",
+            "description": "Citing works: most cited first, or newest first.",
+        },
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+    },
+    "required": ["paper_id"],
+    "additionalProperties": False,
+}
+
+_PAPER_CITATIONS_TOOL = types.Tool(
+    name=PAPER_CITATIONS_TOOL_NAME,
+    description=(
+        "Follow citations for an arXiv paper: the works it references (most cited first) and the "
+        "works that cite it (most cited first, or newest first with order=recent). Both OpenAlex (all "
+        "fields) and INSPIRE-HEP (high energy physics and neighboring fields, updated within days) are "
+        "asked, and each list comes from the source that holds more works for it. Use it to trace a "
+        "result back to its foundations or forward to follow-up work."
+    ),
+    inputSchema=_PAPER_CITATIONS_SCHEMA,
+    annotations=read_only_tool_annotations(open_world=True),
+)
+
+_LOCAL_TOOLS = (_DOWNLOAD_SOURCE_TOOL, _RECENT_PAPERS_TOOL, _PAPER_CITATIONS_TOOL)
+
+RECENT_PAPERS_NOTE = (
+    "Newest first, from arXiv's own listing. Each paper passed every check: its first version was "
+    "submitted inside the window, it carries a requested category, and the query matched as its "
+    "match field says. arXiv adds new submissions at its evening announcement, Sunday through "
+    "Thursday US Eastern time, so a one-day window can be empty."
+)
+UNCHECKED_SYNTAX = "arXiv query syntax, not rechecked"
+CATEGORY_LISTING = "category listing"
 
 
 def _resolve_backend(override: str | None = None) -> str:
@@ -216,7 +315,7 @@ class ArxivBridge:
         )
         filtered = [tool for tool in upstream.tools if tool.name in UPSTREAM_CORE_TOOL_NAMES]
         if cursor in (None, ""):
-            filtered.append(_DOWNLOAD_SOURCE_TOOL)
+            filtered.extend(_LOCAL_TOOLS)
         return types.ListToolsResult(tools=filtered, nextCursor=upstream.nextCursor)
 
     async def list_prompts(self, cursor: str | None = None) -> types.ListPromptsResult:
@@ -239,6 +338,19 @@ class ArxivBridge:
             return _tool_error(f"Tool {name!r} is not advertised by the GPD arXiv bridge")
         if name == DOWNLOAD_SOURCE_TOOL_NAME:
             return await self._call_download_source(arguments or {})
+        if name == RECENT_PAPERS_TOOL_NAME:
+            return await self._call_recent_papers(arguments or {})
+        if name == PAPER_CITATIONS_TOOL_NAME:
+            if self.config.backend == "arxiv-only":
+                return _tool_error("paper_citations uses OpenAlex and INSPIRE-HEP, which the arxiv-only backend turns off")
+            try:
+                body = await asyncio.to_thread(_arxiv_citations.paper_citations, dict(arguments or {}))
+            except Exception as exc:
+                logger.exception("paper_citations failed")
+                return _tool_error(f"paper_citations failed: {exc}")
+            if body.get("status") == "error":
+                return _tool_error(str(body.get("message") or "paper_citations failed"))
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(body, indent=2))])
 
         if self.config.backend == "arxiv-only":
             return await self.session.call_tool(name, arguments or {})
@@ -409,6 +521,93 @@ class ArxivBridge:
             logger.exception("arXiv supplement for a thin OpenAlex result failed")
             return papers
         return _merge_papers(papers, extra or [], requested)
+
+    async def _call_recent_papers(self, arguments: dict[str, object]) -> types.CallToolResult:
+        """Newest arXiv papers on a topic or in categories, each checked before it is returned."""
+        extra = sorted(set(arguments) - {"query", "days", "categories", "max_results"})
+        if extra:
+            return _tool_error(f"recent_papers got unsupported arguments: {', '.join(extra)}")
+        query = arguments.get("query", "")
+        if not isinstance(query, str):
+            return _tool_error("query must be a string")
+        # The dated arXiv search builds its URL by hand, so characters that
+        # end or split a query string (& # % ? = ;) must not reach it.
+        query = " ".join(_URL_UNSAFE.sub(" ", query).split())
+        categories = arguments.get("categories")
+        if categories is not None and (
+            not isinstance(categories, list) or not all(isinstance(c, str) and c.strip() for c in categories)
+        ):
+            return _tool_error("categories must be a list of arXiv category names")
+        categories = [c.strip() for c in categories or []]
+        if not query and not categories:
+            return _tool_error("recent_papers needs a query, categories, or both")
+        days = _bounded_int(arguments.get("days"), default=7, low=1, high=60)
+        limit = _bounded_int(arguments.get("max_results"), default=20, low=1, high=50)
+        today = datetime.now(UTC).date()
+        start = today - timedelta(days=days)
+        base: dict[str, object] = {
+            "date_from": start.isoformat(),
+            # arXiv dates are UTC; an explicit end keeps the window from
+            # depending on this machine's time zone.
+            "date_to": (today + timedelta(days=1)).isoformat(),
+            "sort_by": "date",
+            # The checks below drop loose matches, so fetch arXiv's maximum.
+            "max_results": 50,
+        }
+        if categories:
+            base["categories"] = categories
+
+        phrase = _plain_phrase({"query": query}) if query else None
+        searches = [phrase, " AND ".join(dict.fromkeys(_content_words(query)))] if phrase else [query]
+        kept: list[dict[str, object]] = []
+        seen: set[str] = set()
+        checked = outside_window = off_category = off_topic = 0
+        incomplete = None
+        for index, search in enumerate(searches):
+            result = await self._call_throttled("search_papers", {**base, "query": search})
+            found = _papers_of(result)
+            if found is None:
+                message = _error_text(result, "arXiv search failed")
+                if index == 0:
+                    return _tool_error(message)
+                incomplete = f"The all-words search failed ({message}); papers matching only it may be missing."
+                break
+            for paper in found:
+                key = _paper_key(paper)
+                if not isinstance(paper, dict) or not key or key in seen:
+                    continue
+                seen.add(key)
+                checked += 1
+                published = _published_day(paper)
+                if published is None or published < start:
+                    outside_window += 1
+                    continue
+                if categories and not _in_categories(paper, categories):
+                    off_category += 1
+                    continue
+                match = _topic_match(query, paper) if query else CATEGORY_LISTING
+                if match is None:
+                    off_topic += 1
+                    continue
+                kept.append({**paper, "match": match})
+            if len(kept) >= limit:
+                break
+        kept.sort(key=lambda paper: str(paper.get("published") or ""), reverse=True)
+        body: dict[str, object] = {
+            "query": query,
+            "categories": categories,
+            "window": {"from": start.isoformat(), "to": today.isoformat(), "days": days},
+            "total_results": min(len(kept), limit),
+            "checked": checked,
+            "dropped_outside_window": outside_window,
+            "dropped_category_mismatch": off_category,
+            "dropped_topic_not_found": off_topic,
+            "note": RECENT_PAPERS_NOTE,
+            "papers": kept[:limit],
+        }
+        if incomplete:
+            body["incomplete"] = incomplete
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(body, indent=2))])
 
     async def _arxiv_phrase_search(
         self, args: dict[str, object]
@@ -629,7 +828,7 @@ class ArxivBridge:
         reset: bool,
         complete: bool,
     ) -> None:
-        names = {tool.name for tool in tools if tool.name != DOWNLOAD_SOURCE_TOOL_NAME}
+        names = {tool.name for tool in tools if tool.name not in LOCAL_TOOL_NAMES}
         if reset or self._upstream_tool_names is None:
             self._upstream_tool_names = names
             self._upstream_tool_names_complete = complete
@@ -647,7 +846,7 @@ class ArxivBridge:
         seen_cursors: set[str] = set()
         while True:
             upstream = await self.session.list_tools(cursor)
-            names.update(tool.name for tool in upstream.tools if tool.name != DOWNLOAD_SOURCE_TOOL_NAME)
+            names.update(tool.name for tool in upstream.tools if tool.name not in LOCAL_TOOL_NAMES)
             next_cursor = upstream.nextCursor
             if next_cursor is None:
                 break
@@ -880,6 +1079,190 @@ def _tool_error(message: str) -> types.CallToolResult:
     )
 
 
+_STOPWORDS = frozenset({"a", "an", "the", "of", "and", "or", "in", "on", "for", "to", "with", "by", "from", "at", "as"})
+
+
+def _bounded_int(value: object, *, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+_URL_UNSAFE = re.compile(r"[&#%?=;]")
+
+# TeX accents over one letter: \'e, \"{o}, {\"o}, \v{c}. Letter commands
+# (\v, \c, \u, ...) count only before a brace, so \cal or \bar stay intact.
+_TEX_ACCENT = re.compile(r"\\(?:[`'^\"~=.]|[uvHckdbrt](?=\s*\{))\s*\{?\s*([A-Za-z])\s*\}?")
+_TEX_COMMAND = re.compile(r"\\([A-Za-z]+)")
+
+
+def _normalized(text: str) -> str:
+    """Lowercase words of ``text`` with accents, TeX markup and punctuation removed.
+
+    ``R\\'enyi``, ``Rényi`` and ``Renyi`` all become ``renyi``;
+    ``$\\mathcal{N}=4$`` becomes ``mathcal n 4``.
+    """
+    text = _TEX_ACCENT.sub(r"\1", text)
+    text = _TEX_COMMAND.sub(r" \1 ", text).replace("{", "").replace("}", "")
+    text = unicodedata.normalize("NFKD", text).replace("ß", "ss")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def _stem(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith("sses"):
+        return word[:-2]
+    if word.endswith("es") and word[:-2].endswith(("ss", "x", "ch", "sh")):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _content_words(text: str) -> list[str]:
+    return [word for word in _normalized(text).split() if word not in _STOPWORDS]
+
+
+def _tokens(text: str) -> list[str]:
+    return [_stem(word) for word in _normalized(text).split()]
+
+
+def _has_run(tokens: list[str], run: list[str]) -> bool:
+    """Whether ``run`` occurs in ``tokens`` as consecutive words."""
+    size = len(run)
+    return any(tokens[i : i + size] == run for i in range(len(tokens) - size + 1))
+
+
+def _words_close(tokens: list[str], words: set[str], width: int) -> bool:
+    """Whether every word in ``words`` occurs within some ``width`` consecutive tokens."""
+    for start, token in enumerate(tokens):
+        if token not in words:
+            continue
+        found = set()
+        for later in tokens[start : start + width]:
+            if later in words:
+                found.add(later)
+                if found == words:
+                    return True
+    return False
+
+
+def _published_day(paper: dict[str, object]) -> date | None:
+    raw = paper.get("published")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _in_categories(paper: dict[str, object], wanted: list[str]) -> bool:
+    """Whether the paper lists one of ``wanted`` (``hep-th``, ``cs.LG``, or an archive such as ``cs``)."""
+    have = [str(c).lower() for c in paper.get("categories") or []]
+    targets = [w.strip().lower() for w in wanted if w.strip()]
+    return any(c == w or c.startswith(w + ".") for w in targets for c in have)
+
+
+def _author_matches(value: str, authors: object) -> bool:
+    """Whether one author's name holds every part of an ``au:`` value.
+
+    ``del_maestro`` and ``"Adrian Del Maestro"`` both match Adrian Del
+    Maestro; a single letter matches an initial.
+    """
+    wanted = _normalized(value.replace("_", " ")).split()
+    for name in authors if isinstance(authors, list) else []:
+        have = _normalized(str(name)).split()
+        if all(any(h == w or (len(w) == 1 and h.startswith(w)) for h in have) for w in wanted):
+            return True
+    return not wanted
+
+
+_CHECKED_FIELDS = ("ti", "abs", "au", "cat", "all")
+_CLAUSE = re.compile(r'(?:(ti|abs|au|cat|all):)?(?:"([^"]+)"|([^\s"()*?]+))')
+
+
+def _and_clauses(query: str) -> list[tuple[str, str]] | None:
+    """``(field, value)`` pairs of an arXiv query joined only by AND, else ``None``."""
+    if re.search(r"\b(?:OR|ANDNOT|NOT)\b|[()*?]", query):
+        return None
+    clauses = []
+    for part in re.split(r"\s+AND\s+", query.strip()):
+        prefix = re.match(r"([A-Za-z]+):", part)
+        if prefix and prefix.group(1) not in _CHECKED_FIELDS:
+            return None
+        match = _CLAUSE.fullmatch(part)
+        if match is None:
+            return None
+        clauses.append((match.group(1) or "all", match.group(2) if match.group(2) is not None else match.group(3)))
+    return clauses
+
+
+def _clause_holds(field: str, value: str, paper: dict[str, object], title: list[str], abstract: list[str]) -> bool:
+    if field == "cat":
+        return _in_categories(paper, [value])
+    if field == "au":
+        return _author_matches(value, paper.get("authors"))
+    run = _tokens(value)
+    if field == "ti":
+        return _has_run(title, run)
+    if field == "abs":
+        return _has_run(abstract, run)
+    names = _tokens(" ".join(str(name) for name in paper.get("authors") or []))
+    return _has_run(title, run) or _has_run(abstract, run) or _has_run(names, run)
+
+
+def _topic_match(query: str, paper: dict[str, object]) -> str | None:
+    """How ``query`` shows up in the paper, or ``None`` when it does not.
+
+    Matching ignores case, accents, TeX markup, hyphens and plurals. A plain
+    multi-word query matches as a phrase in the title or abstract, else with
+    every word in the title, else with every word inside a short stretch of
+    the abstract (three words of slack): words scattered through an abstract
+    are how off-topic papers pass a plain AND search. Quoted phrases must
+    appear as written and other words anywhere in the title or abstract.
+    arXiv field queries joined by AND are checked clause by clause (ti, abs,
+    au, cat, all); other arXiv syntax was applied by arXiv and is labeled as
+    not rechecked.
+    """
+    title = _tokens(str(paper.get("title") or ""))
+    abstract = _tokens(str(paper.get("abstract") or "").replace(arxiv_translators.EXTERNAL_CONTENT_PREFIX, "", 1))
+    if _ARXIV_ONLY_QUERY_SYNTAX.search(query) or re.search(r"\b(?:AND|OR|NOT)\b|[()]", query):
+        clauses = _and_clauses(query)
+        if clauses is None:
+            return UNCHECKED_SYNTAX
+        if all(_clause_holds(field, value, paper, title, abstract) for field, value in clauses):
+            return "every query field matched"
+        return None
+    phrases = [run for run in (_tokens(p) for p in re.findall(r'"([^"]*)"', query)) if run]
+    words = {_stem(word) for word in _content_words(re.sub(r'"[^"]*"', " ", query))}
+    vocabulary = set(title) | set(abstract)
+    if not phrases and len(words) > 1:
+        run = _tokens(query)
+        if _has_run(title, run):
+            return "phrase in title"
+        if _has_run(abstract, run):
+            return "phrase in abstract"
+        if words <= set(title):
+            return "all words in title"
+        if _words_close(abstract, words, len(words) + 3):
+            return "all words close together in abstract"
+        return None
+    if not words <= vocabulary:
+        return None
+    if not phrases:
+        return "words in title or abstract"
+    if all(_has_run(title, run) for run in phrases):
+        return "phrase in title"
+    if all(_has_run(title, run) or _has_run(abstract, run) for run in phrases):
+        return "phrase in abstract"
+    return None
+
+
 def _plain_phrase(args: dict[str, object]) -> str | None:
     """Quoted form of a plain multi-word query, or ``None`` for queries that
     already carry quotes, parentheses, boolean operators or arXiv field
@@ -935,6 +1318,11 @@ def _paper_key(paper: object) -> str | None:
     if not isinstance(paper_id, str) or not paper_id.strip():
         return None
     return re.sub(r"v\d+$", "", paper_id.strip())
+
+
+def _error_text(result: types.CallToolResult, default: str) -> str:
+    text = (_first_text_payload(result) or "").strip()
+    return re.sub(r"^Error:\s*", "", text) or default
 
 
 def _first_text_payload(result: types.CallToolResult) -> str | None:

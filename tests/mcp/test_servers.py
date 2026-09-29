@@ -397,7 +397,7 @@ class TestBuiltinServerDescriptors:
         from gpd.mcp.builtin_servers import build_public_descriptors
         from gpd.mcp.servers.arxiv_bridge import (
             ADVERTISED_TOOL_NAMES,
-            DOWNLOAD_SOURCE_TOOL_NAME,
+            LOCAL_TOOL_NAMES,
             UPSTREAM_CORE_TOOL_NAMES,
         )
 
@@ -406,12 +406,12 @@ class TestBuiltinServerDescriptors:
         _assert_semantic_surface(
             descriptor["description"],
             "arxiv descriptor upstream forwarding semantics",
-            required=("baseline upstream tools", "live upstream server", "download_source"),
+            required=("baseline upstream tools", "live upstream server", "download_source", "recent_papers", "paper_citations"),
         )
         assert descriptor["capability_surface"] == "baseline_dynamic_upstream"
         assert descriptor["dynamic_upstream_capabilities"] is True
         assert descriptor["baseline_upstream_capabilities"] == list(UPSTREAM_CORE_TOOL_NAMES)
-        assert descriptor["local_capabilities"] == [DOWNLOAD_SOURCE_TOOL_NAME]
+        assert descriptor["local_capabilities"] == list(LOCAL_TOOL_NAMES)
         assert descriptor["capabilities"] == list(ADVERTISED_TOOL_NAMES)
 
     def test_state_public_descriptor_health_check_is_executable_without_fake_project_path(self):

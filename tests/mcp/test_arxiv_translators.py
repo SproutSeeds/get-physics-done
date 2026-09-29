@@ -389,7 +389,8 @@ def test_search_stops_when_openalex_budget_is_exhausted(monkeypatch):
 
     monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
     res = arxiv_translators.openalex_search({"query": "neural network field theory"})
-    assert res == {"papers": [], "total_results": 0}
+    assert res["papers"] == [] and res["total_results"] == 0
+    assert "frequently_cited" not in res
     assert calls == ['"neural network field theory"']
 
 
@@ -546,3 +547,99 @@ def test_frequently_cited_is_omitted_when_the_lookup_fails(monkeypatch):
     res = arxiv_translators.openalex_search({"query": "sphaleron"})
     assert len(res["papers"]) == 3
     assert "frequently_cited" not in res
+
+
+def _fake_citation_http(work, lists, fail=None):
+    """OpenAlex stand-in: the landing-page lookup returns ``work``; list
+    filters (``cited_by:``/``cites:``) return ``lists[prefix]`` as
+    ``(count, results)``; a prefix in ``fail`` answers with that status."""
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(dict(params))
+        flt = params.get("filter", "")
+        if flt.startswith("locations.landing_page_url:"):
+            return 200, {"results": [work] if work else []}, ""
+        prefix = flt.split(":", 1)[0]
+        if fail and prefix in fail:
+            return fail[prefix], None, ""
+        count, results = lists[prefix]
+        return 200, {"meta": {"count": count}, "results": results}, ""
+
+    return fake_get, calls
+
+
+def test_citations_list_references_and_citing_works_by_influence(monkeypatch):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    work = {"id": "https://openalex.org/W9", "title": "Bulk locality", "publication_year": 2014,
+            "referenced_works": ["https://openalex.org/R1", "https://openalex.org/R2"]}
+    references = [
+        {"id": "https://openalex.org/R2", "title": "Classic book", "publication_year": 2000, "cited_by_count": 900,
+         "doi": "https://doi.org/10.1/book", "locations": []},
+        {"id": "https://openalex.org/R3", "title": "Classic Book", "publication_year": 2010, "cited_by_count": 800,
+         "locations": []},
+        {"id": "https://openalex.org/R1", "title": "Minor", "publication_year": 2001, "cited_by_count": 5, "locations": []},
+    ]
+    citing = [{"id": "https://openalex.org/C1", "title": "Replica wormholes", "publication_year": 2019,
+               "cited_by_count": 933, "locations": [{"landing_page_url": "http://arxiv.org/abs/1911.12333"}]}]
+    fake_get, calls = _fake_citation_http(work, {"cited_by": (64, references), "cites": (801, citing)})
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+
+    res = arxiv_translators.openalex_citations({"paper_id": "arXiv:1411.7041v2", "max_results": 5})
+
+    assert res["status"] == "success" and res["source"] == "OpenAlex" and res["paper_id"] == "1411.7041"
+    assert res["references_total"] == 64
+    assert [r["title"] for r in res["references"]] == ["Classic book", "Minor"]  # repeated title dropped
+    assert res["references"][0]["url"] == "https://doi.org/10.1/book"
+    assert res["cited_by_total"] == 801
+    assert res["cited_by"] == [{"id": "1911.12333", "title": "Replica wormholes", "year": 2019, "cited_by_count": 933,
+                                "url": "https://arxiv.org/abs/1911.12333"}]
+    assert [(c["filter"], c["sort"], c["per-page"]) for c in calls[1:]] == [
+        ("cited_by:W9", "cited_by_count:desc", 15),
+        ("cites:W9", "cited_by_count:desc", 15),
+    ]
+
+
+def test_citations_recent_order_single_direction_and_missing_reference_list(monkeypatch):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    work = {"id": "https://openalex.org/W9", "title": "T", "referenced_works": []}
+    fake_get, calls = _fake_citation_http(work, {"cites": (0, [])})
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_citations({"paper_id": "1411.7041", "direction": "cited_by", "order": "recent"})
+    assert "references" not in res
+    assert calls[-1]["sort"] == "publication_date:desc"
+
+    calls.clear()
+    res = arxiv_translators.openalex_citations({"paper_id": "1411.7041", "direction": "references"})
+    assert res["references"] == [] and res["references_total"] == 0
+    assert len(calls) == 1  # no list request without a reference list
+
+
+def test_citations_report_a_failed_list_and_unindexed_papers(monkeypatch):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    work = {"id": "https://openalex.org/W9", "title": "T", "referenced_works": ["https://openalex.org/R1"]}
+    fake_get, _ = _fake_citation_http(work, {"cited_by": (1, [])}, fail={"cites": 429})
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_citations({"paper_id": "1411.7041"})
+    assert res["status"] == "success" and "cited_by" not in res
+    assert "rate limit" in res["cited_by_error"]
+
+    fake_get, _ = _fake_citation_http(None, {})
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    assert arxiv_translators.openalex_citations({"paper_id": "2609.20001"})["status"] == "not_indexed"
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [({}, "paper_id"), ({"paper_id": "1411.7041 OR title:x"}, "paper_id"),
+     ({"paper_id": "1411.7041", "direction": "up"}, "direction"),
+     ({"paper_id": "1411.7041", "order": "random"}, "order")],
+)
+def test_citations_reject_bad_arguments(args, message):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    res = arxiv_translators.openalex_citations(args)
+    assert res["status"] == "error" and message in res["message"]
