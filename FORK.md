@@ -36,6 +36,7 @@ uv run gpd --help
 | Change | Why | Upstream reference |
 | --- | --- | --- |
 | Bound `mcp` below 2 | mcp 2.0 (July 28, 2026) removed `mcp.server.fastmcp`, so seven of the nine built-in MCP servers failed to import on fresh installs | [#273](https://github.com/psi-oss/get-physics-done/issues/273), [#276](https://github.com/psi-oss/get-physics-done/pull/276) |
+| Look up arXiv papers in OpenAlex by landing page | OpenAlex no longer resolves arXiv DOIs (`10.48550/arxiv.*`) as work DOIs, so arXiv abstract lookups returned HTTP 404 (seen September 29, 2026) | affects upstream too; fork only for now |
 | Repository and issue links point at this fork | Lets `npx -y github:SproutSeeds/get-physics-done --upgrade` install this fork's `main` | fork only |
 | Fork documentation and ownership | This file, the README note, `CODEOWNERS` and the contributing note | fork only |
 
