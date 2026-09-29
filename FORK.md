@@ -35,6 +35,17 @@ before starting your runtime:
 export OPENALEX_API_KEY=your-key
 ```
 
+On macOS you can keep the key in the Keychain instead, which also reaches
+runtimes that do not pass environment variables to MCP servers. When
+`OPENALEX_API_KEY` is unset, GPD reads the Keychain item with service
+`get-physics-done` and account `OPENALEX_API_KEY` (or the item that
+`orp secrets keychain-add --alias openalex-api-key --provider openalex`
+creates):
+
+```bash
+security add-generic-password -s get-physics-done -a OPENALEX_API_KEY -w
+```
+
 To work from a source checkout:
 
 ```bash
@@ -51,7 +62,7 @@ uv run gpd --help
 | Bound `mcp` below 2 | mcp 2.0 (July 28, 2026) removed `mcp.server.fastmcp`, so seven of the nine built-in MCP servers failed to import on fresh installs | [#273](https://github.com/psi-oss/get-physics-done/issues/273), [#276](https://github.com/psi-oss/get-physics-done/pull/276) |
 | Look up arXiv papers in OpenAlex by landing page | OpenAlex no longer resolves arXiv DOIs (`10.48550/arxiv.*`) as work DOIs, so arXiv abstract lookups returned HTTP 404 (seen September 29, 2026) | affects upstream too; fork only for now |
 | Paper search finds the right papers | Search matched plain multi-word queries loosely, kept only works whose *primary* location is arXiv, and sent arXiv field syntax (`ti:`, `au:`, `abs:`, `ANDNOT`) to OpenAlex, which cannot read it. For "neural network field theory" it returned none of 14 known NNFT papers. Now plain queries search the exact phrase first, any arXiv location counts, arXiv syntax goes to arXiv, thin results are topped up from arXiv, and the arXiv fallback also tries the phrase first: 8 of the top 10 are NNFT papers | affects upstream too |
-| OpenAlex API key and budget handling | OpenAlex meters anonymous requests per IP address; `OPENALEX_API_KEY` sends your own key, and a spent budget (HTTP 429) falls back to arXiv without further OpenAlex calls | fork only |
+| OpenAlex API key and budget handling | OpenAlex meters anonymous requests per IP address; `OPENALEX_API_KEY` or a macOS Keychain item sends your own key, and a spent budget (HTTP 429) falls back to arXiv without further OpenAlex calls | fork only |
 | Skip ar5iv failed-conversion pages | ar5iv answers some papers (for example hep-th/9711200) with an error page, which was served and cached as the paper; now the PDF is used, and cached error pages are refetched | affects upstream too |
 | Requests identify this fork | User agents name this repository instead of PSI's operations contact | fork only |
 | Repository and issue links point at this fork | Lets `npx -y github:SproutSeeds/get-physics-done --upgrade` install this fork's `main` | fork only |

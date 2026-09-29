@@ -379,6 +379,7 @@ def test_openalex_api_key_is_sent_as_bearer_token(monkeypatch, key):
         monkeypatch.setenv(arxiv_translators.OPENALEX_API_KEY_ENV, key)
     else:
         monkeypatch.delenv(arxiv_translators.OPENALEX_API_KEY_ENV, raising=False)
+    monkeypatch.setattr(arxiv_translators, "_keychain_api_key", lambda: "")
     monkeypatch.setattr(arxiv_translators.httpx, "get", fake_httpx_get)
     arxiv_translators._http_get("/works", {"search": "x"})
 
@@ -387,3 +388,57 @@ def test_openalex_api_key_is_sent_as_bearer_token(monkeypatch, key):
     else:
         assert "Authorization" not in seen
     assert "psi.inc" not in seen["User-Agent"]
+
+
+def test_environment_key_wins_without_reading_the_keychain(monkeypatch):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("the Keychain must not be read when the variable is set")
+
+    arxiv_translators._keychain_api_key.cache_clear()
+    monkeypatch.setenv(arxiv_translators.OPENALEX_API_KEY_ENV, "env-key")
+    monkeypatch.setattr(arxiv_translators.subprocess, "run", no_subprocess)
+    assert arxiv_translators.openalex_api_key() == "env-key"
+
+
+def test_keychain_supplies_the_key_on_macos(monkeypatch):
+    """GPD's own Keychain item is tried first, then ORP's; the first hit wins."""
+    import subprocess as _subprocess
+
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd[cmd.index("-s") + 1], cmd[cmd.index("-a") + 1]))
+        if cmd[cmd.index("-s") + 1] == "orp.secret.openalex":
+            return _subprocess.CompletedProcess(cmd, 0, stdout="keychain-key\n", stderr="")
+        return _subprocess.CompletedProcess(cmd, 44, stdout="", stderr="not found")
+
+    arxiv_translators._keychain_api_key.cache_clear()
+    monkeypatch.delenv(arxiv_translators.OPENALEX_API_KEY_ENV, raising=False)
+    monkeypatch.setattr(arxiv_translators.sys, "platform", "darwin")
+    monkeypatch.setattr(arxiv_translators.shutil, "which", lambda name: "/usr/bin/security")
+    monkeypatch.setattr(arxiv_translators.subprocess, "run", fake_run)
+    try:
+        assert arxiv_translators.openalex_api_key() == "keychain-key"
+        assert calls == list(arxiv_translators.KEYCHAIN_ITEMS)
+    finally:
+        arxiv_translators._keychain_api_key.cache_clear()
+
+
+def test_keychain_is_not_consulted_off_macos(monkeypatch):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("no Keychain lookup outside macOS")
+
+    arxiv_translators._keychain_api_key.cache_clear()
+    monkeypatch.delenv(arxiv_translators.OPENALEX_API_KEY_ENV, raising=False)
+    monkeypatch.setattr(arxiv_translators.sys, "platform", "linux")
+    monkeypatch.setattr(arxiv_translators.subprocess, "run", no_subprocess)
+    try:
+        assert arxiv_translators.openalex_api_key() == ""
+    finally:
+        arxiv_translators._keychain_api_key.cache_clear()

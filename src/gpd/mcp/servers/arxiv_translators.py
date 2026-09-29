@@ -23,6 +23,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
+from functools import lru_cache
 from urllib.parse import quote
 
 import httpx
@@ -57,10 +61,45 @@ _HEADERS = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
 # personal key has its own budget: https://help.openalex.org/api/authentication/
 OPENALEX_API_KEY_ENV = "OPENALEX_API_KEY"
 
+# macOS Keychain items read when OPENALEX_API_KEY is unset, as (service,
+# account): GPD's own item, then the item `orp secrets keychain-add --alias
+# openalex-api-key --provider openalex` creates. Some runtimes pass only an
+# allowlist of environment variables to MCP servers, and a key must not be
+# written into their config files, so the server looks it up itself.
+KEYCHAIN_ITEMS = (
+    ("get-physics-done", "OPENALEX_API_KEY"),
+    ("orp.secret.openalex", "openalex-api-key"),
+)
+
+
+@lru_cache(maxsize=1)
+def _keychain_api_key() -> str:
+    if sys.platform != "darwin" or shutil.which("security") is None:
+        return ""
+    for service, account in KEYCHAIN_ITEMS:
+        try:
+            proc = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        key = proc.stdout.strip()
+        if proc.returncode == 0 and key:
+            return key
+    return ""
+
+
+def openalex_api_key() -> str:
+    """The OpenAlex key from ``OPENALEX_API_KEY``, else the macOS Keychain, else ``""``."""
+    return os.environ.get(OPENALEX_API_KEY_ENV, "").strip() or _keychain_api_key()
+
 
 def _request_headers() -> dict[str, str]:
     headers = dict(_HEADERS)
-    key = os.environ.get(OPENALEX_API_KEY_ENV, "").strip()
+    key = openalex_api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
     return headers
