@@ -63,9 +63,9 @@ OPENALEX_API_KEY_ENV = "OPENALEX_API_KEY"
 
 # macOS Keychain items read when OPENALEX_API_KEY is unset, as (service,
 # account): GPD's own item, then the item `orp secrets keychain-add --alias
-# openalex-api-key --provider openalex` creates. Runtimes such as Codex pass
-# only an allowlist of environment variables to MCP servers, and a key must not
-# be written into their config files, so the server looks it up itself.
+# openalex-api-key --provider openalex` creates. Some runtimes pass only an
+# allowlist of environment variables to MCP servers, and a key must not be
+# written into their config files, so the server looks it up itself.
 KEYCHAIN_ITEMS = (
     ("get-physics-done", "OPENALEX_API_KEY"),
     ("orp.secret.openalex", "openalex-api-key"),
