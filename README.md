@@ -1,5 +1,8 @@
 # Get Physics Done (GPD)
 
+> [!NOTE]
+> **Community-maintained fork.** This is the [SproutSeeds](https://github.com/SproutSeeds) fork of [Get Physics Done](https://github.com/psi-oss/get-physics-done) by Physical Superintelligence PBC. Upstream has not merged a change since May 2026, so issues, discussions and pull requests are handled here. Install the maintained version with `npx -y github:SproutSeeds/get-physics-done --upgrade`, and see [FORK.md](https://github.com/SproutSeeds/get-physics-done/blob/main/FORK.md) for what differs from upstream. Not affiliated with PSI.
+
 ### Built by physicists, for physicists
 
 <p align="center">

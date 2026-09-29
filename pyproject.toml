@@ -80,8 +80,8 @@ gpd = "gpd.cli:entrypoint"
 [project.urls]
 Homepage = "https://github.com/psi-oss/get-physics-done"
 Documentation = "https://github.com/psi-oss/get-physics-done#readme"
-Repository = "https://github.com/psi-oss/get-physics-done"
-Issues = "https://github.com/psi-oss/get-physics-done/issues"
+Repository = "https://github.com/SproutSeeds/get-physics-done"
+Issues = "https://github.com/SproutSeeds/get-physics-done/issues"
 
 [build-system]
 requires = ["hatchling==1.29.0"]

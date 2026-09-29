@@ -765,7 +765,7 @@ def test_public_bootstrap_package_exposes_npx_installer() -> None:
     assert package_json["name"] == "get-physics-done"
     assert package_json["repository"] == {
         "type": "git",
-        "url": "git+https://github.com/psi-oss/get-physics-done.git",
+        "url": "git+https://github.com/SproutSeeds/get-physics-done.git",
     }
     assert package_json.get("engines") == {"node": ">=20"}
     assert package_json.get("bin", {}).get("get-physics-done") == "bin/install.js"

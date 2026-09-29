@@ -6,6 +6,8 @@ GPD is published by Physical Superintelligence PBC (PSI) as an open-source commu
 
 ## Contributor License Agreement (CLA)
 
+> **In the SproutSeeds fork:** contributions to `SproutSeeds/get-physics-done` are accepted under the Apache 2.0 license without signing PSI's CLA. The CLA below applies to pull requests sent upstream to `psi-oss/get-physics-done`. See [FORK.md](FORK.md).
+
 All contributors must sign a CLA before their pull requests can be merged.
 
 - Individual contributors should review `CLA/GPD_CLA_Individual.pdf`; signing is handled automatically via the CLA Assistant GitHub flow at https://cla-assistant.io/psi-oss/get-physics-done.

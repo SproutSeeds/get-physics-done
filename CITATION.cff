@@ -9,7 +9,7 @@ abstract: "An open-source agentic AI system for physics research that structures
 authors:
   - name: "Physical Superintelligence PBC"
     affiliation: "Physical Superintelligence PBC"
-repository-code: "https://github.com/psi-oss/get-physics-done"
+repository-code: "https://github.com/SproutSeeds/get-physics-done"
 url: "https://www.psi.inc"
 keywords:
   - "physical superintelligence"
