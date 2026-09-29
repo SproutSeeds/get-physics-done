@@ -416,7 +416,7 @@ def test_public_mcp_descriptor_entry_point_alternatives_match_pyproject_scripts(
 
 def test_arxiv_descriptor_tracks_optional_dependency_surface() -> None:
     from gpd.mcp.builtin_servers import build_public_descriptors
-    from gpd.mcp.servers.arxiv_bridge import ADVERTISED_TOOL_NAMES, DOWNLOAD_SOURCE_TOOL_NAME, UPSTREAM_CORE_TOOL_NAMES
+    from gpd.mcp.servers.arxiv_bridge import ADVERTISED_TOOL_NAMES, LOCAL_TOOL_NAMES, UPSTREAM_CORE_TOOL_NAMES
 
     project = tomllib.loads(_read("pyproject.toml"))["project"]
     dependencies: list[str] = project["dependencies"]
@@ -446,9 +446,9 @@ def test_arxiv_descriptor_tracks_optional_dependency_surface() -> None:
     assert descriptor["capability_surface"] == "baseline_dynamic_upstream"
     assert descriptor["dynamic_upstream_capabilities"] is True
     assert descriptor["baseline_upstream_capabilities"] == list(UPSTREAM_CORE_TOOL_NAMES)
-    assert descriptor["local_capabilities"] == [DOWNLOAD_SOURCE_TOOL_NAME]
+    assert descriptor["local_capabilities"] == list(LOCAL_TOOL_NAMES)
     assert descriptor["capabilities"] == list(ADVERTISED_TOOL_NAMES)
-    assert descriptor["capabilities"][-1] == "download_source"
+    assert descriptor["capabilities"][-len(LOCAL_TOOL_NAMES):] == ["download_source", "recent_papers", "paper_citations"]
 
 
 def test_paper_journal_vocabulary_docs_match_builder_contract() -> None:

@@ -91,6 +91,7 @@ _EXPECTED_OPTIONAL_IMPORT_LOCATIONS = {
     "cairosvg": {"src/gpd/mcp/paper/figures.py"},
     "httpx": {
         "src/gpd/mcp/servers/_arxiv_ar5iv.py",
+        "src/gpd/mcp/servers/_arxiv_citations.py",
         "src/gpd/mcp/servers/_arxiv_gcs.py",
         "src/gpd/mcp/servers/arxiv_translators.py",
     },

@@ -16,7 +16,7 @@ import sys
 from copy import deepcopy
 
 from gpd.mcp.descriptor_text import SKILLS_SERVER_DESCRIPTION
-from gpd.mcp.servers.arxiv_bridge import ADVERTISED_TOOL_NAMES, DOWNLOAD_SOURCE_TOOL_NAME, UPSTREAM_CORE_TOOL_NAMES
+from gpd.mcp.servers.arxiv_bridge import ADVERTISED_TOOL_NAMES, LOCAL_TOOL_NAMES, UPSTREAM_CORE_TOOL_NAMES
 from gpd.mcp.verification_contract_policy import verification_server_description
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ _ARXIV_EXTRA_PREREQUISITE = (
 )
 _ENTRY_POINT_NOTES = _PYTHON_LAUNCH_NOTES
 _ARXIV_UPSTREAM_CAPABILITIES = list(UPSTREAM_CORE_TOOL_NAMES)
-_ARXIV_LOCAL_CAPABILITIES = [DOWNLOAD_SOURCE_TOOL_NAME]
+_ARXIV_LOCAL_CAPABILITIES = list(LOCAL_TOOL_NAMES)
 _ARXIV_CAPABILITIES = list(ADVERTISED_TOOL_NAMES)
 
 _PUBLIC_DESCRIPTOR_METADATA: dict[str, dict[str, object]] = {
@@ -238,7 +238,8 @@ _PUBLIC_DESCRIPTOR_METADATA: dict[str, dict[str, object]] = {
         "description": (
             "Optional arXiv bridge for arxiv-mcp-server. Advertises the baseline upstream tools "
             f"{', '.join(_ARXIV_UPSTREAM_CAPABILITIES)}, forwards only tools exposed "
-            f"by the live upstream server, and adds GPD {DOWNLOAD_SOURCE_TOOL_NAME} for raw source archives."
+            "by the live upstream server, and adds GPD download_source for raw source archives, "
+            "recent_papers for verified new arXiv listings and paper_citations for references and citing works."
         ),
         "capability_surface": "baseline_dynamic_upstream",
         "dynamic_upstream_capabilities": True,

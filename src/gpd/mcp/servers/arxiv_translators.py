@@ -381,13 +381,20 @@ def openalex_search(args: dict[str, object]) -> dict[str, object]:
             break
 
     papers = papers[:per_page]
-    result: dict[str, object] = {"papers": papers, "total_results": len(papers)}
+    result: dict[str, object] = {"papers": papers, "total_results": len(papers), "coverage_note": COVERAGE_NOTE}
     cited = frequently_cited(works[:per_page])
     if cited:
         result["frequently_cited"] = cited
         result["frequently_cited_note"] = FREQUENTLY_CITED_NOTE
     return result
 
+
+# Measured 2026-09-29 on hep-th: 0 of 50 papers submitted 2 to 3 days earlier were
+# in OpenAlex, 69 of 70 submitted 5 to 45 days earlier were.
+COVERAGE_NOTE = (
+    "OpenAlex adds new arXiv papers about five days after submission; "
+    "use recent_papers for the newest ones."
+)
 
 FREQUENTLY_CITED_NOTE = (
     "Works cited by several of these results; for a topic they are often the foundational "
@@ -513,6 +520,130 @@ def openalex_abstract(args: dict[str, object]) -> dict[str, object]:
     }
 
 
+_CITATION_SELECT = "id,title,publication_year,doi,ids,primary_location,locations,cited_by_count"
+
+
+def unique_titles(works: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Drop repeated titles (OpenAlex keeps some works, such as book editions, twice)."""
+    seen: set[str] = set()
+    out = []
+    for work in works:
+        key = re.sub(r"[^a-z0-9]+", " ", str(work.get("title") or "").lower()).strip()
+        if key and key in seen:
+            continue
+        seen.add(key)
+        out.append(work)
+    return out
+
+
+def _citation_entry(work: dict[str, object]) -> dict[str, object]:
+    arxiv_id = _extract_arxiv_id(work) or ""
+    doi = work.get("doi") if isinstance(work.get("doi"), str) else ""
+    return {
+        "id": arxiv_id,
+        "title": work.get("title") or "",
+        "year": work.get("publication_year") or 0,
+        "cited_by_count": work.get("cited_by_count") or 0,
+        "url": f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else (doi or str(work.get("id") or "")),
+    }
+
+
+_CITATION_ID_RE = re.compile(r"(?:\d{4}\.\d{4,5}|[a-z][a-z\-]*(?:\.[a-z]{2})?/\d{7})(?:v\d+)?", re.IGNORECASE)
+
+
+def parse_citation_args(args: dict[str, object]) -> tuple[str, str, str, int]:
+    """``(paper_id, direction, order, max_results)`` for a citations request.
+
+    Raises ``ValueError`` with a caller-facing message. The id must look like
+    an arXiv id (an ``arXiv:`` prefix and a version suffix are accepted), so
+    it can go into source query syntax as written.
+    """
+    raw = args.get("paper_id")
+    paper_id = re.sub(r"^arxiv:", "", raw.strip(), flags=re.IGNORECASE) if isinstance(raw, str) else ""
+    if not _CITATION_ID_RE.fullmatch(paper_id):
+        raise ValueError("paper_id must be an arXiv id such as 1411.7041 or hep-th/9711200")
+    direction = args.get("direction") or "both"
+    order = args.get("order") or "influential"
+    if direction not in ("both", "references", "cited_by"):
+        raise ValueError("direction must be both, references or cited_by")
+    if order not in ("influential", "recent"):
+        raise ValueError("order must be influential or recent")
+    try:
+        limit = max(1, min(50, int(args.get("max_results", 20))))
+    except (TypeError, ValueError):
+        limit = 20
+    return _strip_version(paper_id), str(direction), str(order), limit
+
+
+def http_problem(status: int) -> str:
+    """Short description of a failed HTTP status for error messages."""
+    if status == 0:
+        return "network error"
+    if status == 429:
+        return "HTTP 429: rate limit or daily budget reached"
+    return f"HTTP {status}"
+
+
+def openalex_citations(args: dict[str, object]) -> dict[str, object]:
+    """References and citing works of an arXiv paper, from OpenAlex.
+
+    ``args``: ``paper_id`` (required), ``direction`` (``both``, ``references``
+    or ``cited_by``; default ``both``), ``order`` for citing works
+    (``influential``: most cited first, default; ``recent``: newest first) and
+    ``max_results`` (1-50, default 20) per list. References come most cited
+    first from the ``cited_by`` filter, one request per list. Brand-new arXiv
+    papers are not in OpenAlex yet; they come back with ``status:
+    not_indexed``. A list whose request fails carries ``<list>_error``.
+    """
+    try:
+        paper_id, direction, order, limit = parse_citation_args(args)
+    except ValueError as exc:
+        return {"status": "error", "source": "OpenAlex", "message": str(exc)}
+
+    status, work = _find_arxiv_work(paper_id)
+    if work is None and status == 200:
+        return {"status": "not_indexed", "source": "OpenAlex", "paper_id": paper_id}
+    if work is None:
+        return {
+            "status": "error",
+            "source": "OpenAlex",
+            "paper_id": paper_id,
+            "message": f"OpenAlex lookup failed ({http_problem(status)})",
+        }
+
+    work_id = str(work.get("id") or "").rsplit("/", 1)[-1]
+    result: dict[str, object] = {
+        "status": "success",
+        "source": "OpenAlex",
+        "paper_id": paper_id,
+        "title": work.get("title") or "",
+        "year": work.get("publication_year") or 0,
+    }
+    lists = []
+    if direction in ("both", "references"):
+        if work.get("referenced_works"):
+            lists.append(("references", f"cited_by:{work_id}", "cited_by_count:desc"))
+        else:
+            result["references_total"] = 0
+            result["references"] = []
+    if direction in ("both", "cited_by"):
+        sort = "cited_by_count:desc" if order == "influential" else "publication_date:desc"
+        lists.append(("cited_by", f"cites:{work_id}", sort))
+    for key, flt, sort in lists:
+        # A few extra rows leave room for the repeated titles unique_titles drops.
+        status, body, _ = _http_get(
+            "/works", {"filter": flt, "sort": sort, "per-page": min(50, limit + 10), "select": _CITATION_SELECT}
+        )
+        if status != 200 or body is None:
+            result[f"{key}_error"] = f"OpenAlex {key} lookup failed ({http_problem(status)})"
+            continue
+        meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+        works = [w for w in body.get("results") or [] if isinstance(w, dict)]
+        result[f"{key}_total"] = meta.get("count", len(works))
+        result[key] = [_citation_entry(w) for w in unique_titles(works)[:limit]]
+    return result
+
+
 def _abstract_error(paper_id: str, message: str) -> dict[str, object]:
     return {
         "status": "error",
@@ -532,6 +663,10 @@ __all__ = [
     "phrase_form",
     "gcs_fetch_pdf",
     "openalex_abstract",
+    "http_problem",
+    "openalex_citations",
+    "parse_citation_args",
+    "unique_titles",
     "openalex_results_to_papers",
     "openalex_search",
 ]
