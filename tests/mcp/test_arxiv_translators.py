@@ -97,12 +97,20 @@ def test_search_new_format_id_extractable(translators):
         assert p["abstract"].startswith("[EXTERNAL CONTENT]"), "must preserve upstream prefix"
 
 
+def _skip_if_budget_exhausted(res: dict) -> None:
+    """OpenAlex answers HTTP 429 once the shared anonymous daily budget for the
+    caller's IP is spent (CI runners share IPs); that is not a translator bug."""
+    if res.get("status") == "error" and "HTTP 429" in str(res.get("message", "")):
+        pytest.skip("OpenAlex daily budget exhausted for this IP (HTTP 429)")
+
+
 @pytest.mark.skipif(not NETWORK, reason="network probes disabled")
 def test_abstract_new_format(translators):
     _, openalex_abstract, _ = translators
     res = openalex_abstract({"paper_id": PAPERS["new_format"]})
     assert isinstance(res, dict)
     assert set(res.keys()) >= UPSTREAM_ABSTRACT_KEYS
+    _skip_if_budget_exhausted(res)
     assert res["status"] == "success"
     assert res["paper_id"] == PAPERS["new_format"]
     assert res["abstract"].startswith("[EXTERNAL CONTENT]")
@@ -113,6 +121,7 @@ def test_abstract_new_format(translators):
 def test_abstract_old_format(translators):
     _, openalex_abstract, _ = translators
     res = openalex_abstract({"paper_id": PAPERS["old_format"]})
+    _skip_if_budget_exhausted(res)
     assert res["status"] == "success"
     assert isinstance(res["categories"], list)
 
@@ -279,3 +288,102 @@ def test_abstract_lookup_falls_back_to_doi_singleton(monkeypatch):
     assert res["status"] == "error"
     assert "HTTP 404" in res["message"]
     assert calls == ["/works", "/works/doi:10.48550%2Farxiv.2401.12345"]
+
+
+def _work(arxiv_id: str) -> dict:
+    return {
+        "id": f"https://openalex.org/W{abs(hash(arxiv_id)) % 10**9}",
+        "title": f"T {arxiv_id}",
+        "authorships": [{"author": {"display_name": "A"}}],
+        "abstract_inverted_index": {"x": [0]},
+        "locations": [{"landing_page_url": f"http://arxiv.org/abs/{arxiv_id}"}],
+        "publication_date": "2024-01-01",
+        "concepts": [],
+    }
+
+
+def test_search_uses_any_arxiv_location_and_phrase_first(monkeypatch):
+    """A plain multi-word query is searched as a quoted phrase over works with
+    any arXiv location; the loose query then fills the remaining slots without
+    duplicates. No network: fakes the HTTP layer."""
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(dict(params))
+        if params["search"].startswith('"'):
+            return 200, {"results": [_work("2008.08601")]}, ""
+        return 200, {"results": [_work("2008.08601"), _work("2112.04527")]}, ""
+
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_search({"query": "neural network field theory", "max_results": 5})
+
+    assert [p["id"] for p in res["papers"]] == ["2008.08601", "2112.04527"]
+    assert res["total_results"] == 2
+    assert [c["search"] for c in calls] == ['"neural network field theory"', "neural network field theory"]
+    assert all(c["filter"] == f"locations.source.id:{arxiv_translators.OPENALEX_ARXIV_SOURCE_ID}" for c in calls)
+
+
+@pytest.mark.parametrize("query", ['"reflection positivity"', "sphaleron", "lattice AND QCD", "(a b) c"])
+def test_search_sends_quoted_boolean_and_single_word_queries_once(monkeypatch, query):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(params["search"])
+        return 200, {"results": [_work("2401.12345")]}, ""
+
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    arxiv_translators.openalex_search({"query": query, "max_results": 5})
+    assert calls == [query]
+
+
+def test_search_stops_when_openalex_budget_is_exhausted(monkeypatch):
+    """HTTP 429 means the daily budget is spent; the second query would only
+    spend more, so the translator returns what it has and the bridge falls
+    back to arXiv."""
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(params["search"])
+        return 429, {"error": "Rate limit exceeded"}, ""
+
+    monkeypatch.setattr(arxiv_translators, "_http_get", fake_get)
+    res = arxiv_translators.openalex_search({"query": "neural network field theory"})
+    assert res == {"papers": [], "total_results": 0}
+    assert calls == ['"neural network field theory"']
+
+
+@pytest.mark.parametrize("key", ["", "test-key"])
+def test_openalex_api_key_is_sent_as_bearer_token(monkeypatch, key):
+    from gpd.mcp.servers import arxiv_translators  # type: ignore
+
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"results": []}
+
+    def fake_httpx_get(url, params=None, headers=None, timeout=None):
+        seen.update(headers or {})
+        return FakeResponse()
+
+    if key:
+        monkeypatch.setenv(arxiv_translators.OPENALEX_API_KEY_ENV, key)
+    else:
+        monkeypatch.delenv(arxiv_translators.OPENALEX_API_KEY_ENV, raising=False)
+    monkeypatch.setattr(arxiv_translators.httpx, "get", fake_httpx_get)
+    arxiv_translators._http_get("/works", {"search": "x"})
+
+    if key:
+        assert seen["Authorization"] == f"Bearer {key}"
+    else:
+        assert "Authorization" not in seen
+    assert "psi.inc" not in seen["User-Agent"]

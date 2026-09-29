@@ -18,10 +18,7 @@ logger = logging.getLogger("gpd.arxiv_bridge.gcs")
 _GCS_BASE = "https://storage.googleapis.com/arxiv-dataset/arxiv"
 _ARXIV_PDF_BASE = "https://arxiv.org/pdf"
 
-_USER_AGENT = (
-    f"gpd-arxiv-bridge/{GPD_VERSION} "
-    "(+https://github.com/psi-oss/get-physics-done; mailto:ops@psi.inc)"
-)
+_USER_AGENT = f"gpd-arxiv-bridge/{GPD_VERSION} (+https://github.com/SproutSeeds/get-physics-done)"
 _HEADERS = {"User-Agent": _USER_AGENT}
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 # Cap downloaded PDF size so a runaway response cannot OOM the bridge.

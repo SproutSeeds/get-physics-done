@@ -460,10 +460,11 @@ async def test_search_papers_defaults_sort_by_relevance(
     finally:
         bridge._session = None
 
+    # A plain multi-word query reaches arXiv as an exact phrase first.
     assert log == [
         (
             "search_papers",
-            {"query": "attention is all you need", "sort_by": "relevance"},
+            {"query": '"attention is all you need"', "sort_by": "relevance"},
         )
     ]
 
@@ -502,9 +503,10 @@ async def test_search_papers_preserves_caller_sort_by(
 async def test_search_papers_short_circuits_to_openalex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the OpenAlex translator returns a non-empty papers list, the
-    bridge must serve that response and skip the upstream session entirely —
-    that is the entire point of routing `export.arxiv.org` load away."""
+    """When the OpenAlex translator returns at least half the requested
+    papers, the bridge must serve that response and skip the upstream session
+    entirely — that is the entire point of routing `export.arxiv.org` load
+    away. Thinner results are topped up from arXiv (tested separately)."""
     from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
     from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
 
@@ -519,21 +521,20 @@ async def test_search_papers_short_circuits_to_openalex(
 
     def fake_search(args: dict) -> dict:
         translator_called.append(args)
-        return {
-            "papers": [
-                {
-                    "id": "2401.12345",
-                    "title": "T",
-                    "authors": ["A"],
-                    "abstract": "[EXTERNAL CONTENT] x",
-                    "categories": [],
-                    "published": "2024-01-22",
-                    "url": "https://arxiv.org/abs/2401.12345",
-                    "resource_uri": "arxiv://2401.12345",
-                }
-            ],
-            "total_results": 1,
-        }
+        papers = [
+            {
+                "id": f"2401.1234{n}",
+                "title": "T",
+                "authors": ["A"],
+                "abstract": "[EXTERNAL CONTENT] x",
+                "categories": [],
+                "published": "2024-01-22",
+                "url": f"https://arxiv.org/abs/2401.1234{n}",
+                "resource_uri": f"arxiv://2401.1234{n}",
+            }
+            for n in range(5)
+        ]
+        return {"papers": papers, "total_results": len(papers)}
 
     monkeypatch.setattr(arxiv_translators, "openalex_search", fake_search)
 
@@ -549,7 +550,7 @@ async def test_search_papers_short_circuits_to_openalex(
     assert log == [], "upstream session must not be called when OpenAlex returns results"
     assert result.isError is None or result.isError is False
     payload = result.content[0].text
-    assert "2401.12345" in payload
+    assert "2401.12340" in payload
 
 
 @pytest.mark.asyncio
@@ -1128,3 +1129,276 @@ def test_resolve_backend_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setenv("GPD_ARXIV_BACKEND", "potato")
     assert _resolve_backend() == "hybrid"
+
+
+def _paper(paper_id: str) -> dict:
+    return {
+        "id": paper_id,
+        "title": f"T {paper_id}",
+        "authors": ["A"],
+        "abstract": "[EXTERNAL CONTENT] x",
+        "categories": [],
+        "published": "2024-01-22",
+        "url": f"https://arxiv.org/abs/{paper_id}",
+        "resource_uri": f"arxiv://{paper_id}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_papers_supplements_thin_openalex_results_from_arxiv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A niche phrase can match only a few OpenAlex works; the bridge then
+    tops the list up from arXiv's own search, keeping OpenAlex order and
+    dropping duplicates by version-stripped id."""
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        arxiv_translators,
+        "openalex_search",
+        lambda args: {"papers": [_paper("2008.08601")], "total_results": 1},
+    )
+    phrase_hits = _json.dumps(
+        {"total_results": 3, "papers": [_paper("2008.08601v2"), _paper("2112.04527v1"), _paper("2307.03223v1")]}
+    )
+    term_hits = _json.dumps({"total_results": 1, "papers": [_paper("2409.12222v1")]})
+    fake, log = _make_fake_session(call_outputs=[(phrase_hits, False), (term_hits, False)])
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("search_papers", {"query": "neural network field theory", "max_results": 10})
+    finally:
+        bridge._session = None
+
+    assert [call[1]["query"] for call in log] == [
+        '"neural network field theory"',
+        "neural AND network AND field AND theory",
+    ]
+    text = result.content[0].text
+    body = _json.loads(text[text.index("{"):])
+    assert [p["id"] for p in body["papers"]] == ["2008.08601", "2112.04527v1", "2307.03223v1", "2409.12222v1"]
+    assert body["total_results"] == 4
+
+
+@pytest.mark.asyncio
+async def test_search_papers_keeps_openalex_results_when_arxiv_supplement_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        arxiv_translators,
+        "openalex_search",
+        lambda args: {"papers": [_paper("2008.08601")], "total_results": 1},
+    )
+    fake, log = _make_fake_session(call_outputs=[("Error: arXiv API HTTP error - 503", True)])
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("search_papers", {"query": "neural network field theory"})
+    finally:
+        bridge._session = None
+
+    assert len(log) == 1
+    text = result.content[0].text
+    body = _json.loads(text[text.index("{"):])
+    assert [p["id"] for p in body["papers"]] == ["2008.08601"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        'ti:"reflection positivity"',
+        'au:Halverson AND "field theory"',
+        '"neural networks" ANDNOT survey',
+        "cat:hep-th AND lattice",
+        'abs:"telegraph process"',
+    ],
+)
+async def test_search_papers_routes_arxiv_field_syntax_to_upstream(
+    query: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Field prefixes and ANDNOT are arXiv syntax; OpenAlex would read them as
+    words, so these queries skip the OpenAlex translator."""
+    from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    translator_called: list[dict] = []
+    monkeypatch.setattr(
+        arxiv_translators,
+        "openalex_search",
+        lambda args: translator_called.append(args) or {"papers": [_paper("2401.12345")], "total_results": 1},
+    )
+    fake, log = _make_fake_session()
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        await bridge.call_tool("search_papers", {"query": query})
+    finally:
+        bridge._session = None
+
+    assert translator_called == []
+    assert log and log[0][0] == "search_papers"
+    assert log[0][1]["query"] == query
+
+
+@pytest.mark.asyncio
+async def test_download_paper_ignores_cached_conversion_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """An older bridge cached ar5iv's failed-conversion page as the paper;
+    download_paper must fetch the paper again instead of serving it."""
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_ar5iv, _arxiv_gcs, _arxiv_token_bucket
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(_arxiv_ar5iv, "fetch_html_content", lambda pid: None)
+    monkeypatch.setattr(_arxiv_gcs, "fetch_pdf_from_gcs", lambda pid: b"fake-pdf-bytes")
+    monkeypatch.setattr(_arxiv_gcs, "pdf_bytes_to_markdown", lambda pdf, pid, storage: "# AdS/CFT\n\nbody")
+    stub = "No content available\nConversion to HTML had a Fatal error and exited abruptly."
+    (tmp_path / "hep-th_9711200.md").write_text(stub, encoding="utf-8")
+
+    fake, log = _make_fake_session()
+    bridge = ArxivBridge(ArxivBridgeConfig(storage_path=tmp_path, backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("download_paper", {"paper_id": "hep-th/9711200"})
+    finally:
+        bridge._session = None
+
+    payload = _json.loads(result.content[0].text)
+    assert payload["source"] == "pdf-gcs"
+    assert "# AdS/CFT" in payload["content"]
+    assert "Fatal error" not in (tmp_path / "hep-th_9711200.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_read_paper_refetches_cached_conversion_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_ar5iv, _arxiv_gcs, _arxiv_token_bucket
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(_arxiv_ar5iv, "fetch_html_content", lambda pid: None)
+    monkeypatch.setattr(_arxiv_gcs, "fetch_pdf_from_gcs", lambda pid: b"fake-pdf-bytes")
+    monkeypatch.setattr(_arxiv_gcs, "pdf_bytes_to_markdown", lambda pdf, pid, storage: "# AdS/CFT\n\nbody")
+    (tmp_path / "hep-th_9711200.md").write_text(
+        "No content available\nConversion to HTML had a Fatal error and exited abruptly.", encoding="utf-8"
+    )
+
+    fake, log = _make_fake_session()
+    bridge = ArxivBridge(ArxivBridgeConfig(storage_path=tmp_path, backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("read_paper", {"paper_id": "hep-th/9711200"})
+    finally:
+        bridge._session = None
+
+    assert log == []
+    payload = _json.loads(result.content[0].text)
+    assert payload["source"] == "pdf-gcs"
+    assert "# AdS/CFT" in payload["content"]
+
+
+@pytest.mark.asyncio
+async def test_search_papers_arxiv_fallback_tries_phrase_then_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With OpenAlex empty (for example its daily budget is spent), a plain
+    multi-word query goes to arXiv as an exact phrase first; a thin phrase
+    result is filled from the words joined by AND."""
+    import json as _json
+
+    from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(arxiv_translators, "openalex_search", lambda args: {"papers": [], "total_results": 0})
+    phrase_hits = _json.dumps({"total_results": 1, "papers": [_paper("2008.08601v2")]})
+    term_hits = _json.dumps({"total_results": 2, "papers": [_paper("2008.08601v2"), _paper("2112.04527v1")]})
+    fake, log = _make_fake_session(call_outputs=[(phrase_hits, False), (term_hits, False)])
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("search_papers", {"query": "neural network field theory", "max_results": 10})
+    finally:
+        bridge._session = None
+
+    assert [call[1]["query"] for call in log] == [
+        '"neural network field theory"',
+        "neural AND network AND field AND theory",
+    ]
+    body = _json.loads(result.content[0].text)
+    assert [p["id"] for p in body["papers"]] == ["2008.08601v2", "2112.04527v1"]
+
+
+@pytest.mark.asyncio
+async def test_search_papers_arxiv_fallback_passes_errors_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpd.mcp.servers import _arxiv_token_bucket, arxiv_translators
+    from gpd.mcp.servers.arxiv_bridge import ArxivBridge, ArxivBridgeConfig
+
+    _arxiv_token_bucket._reset_for_tests()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_arxiv_token_bucket.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(arxiv_translators, "openalex_search", lambda args: {"papers": [], "total_results": 0})
+    fake, log = _make_fake_session(call_outputs=[("Error: arXiv API HTTP error - 503", True)])
+    bridge = ArxivBridge(ArxivBridgeConfig(backend="hybrid"))
+    bridge._session = fake  # type: ignore[assignment]
+    try:
+        result = await bridge.call_tool("search_papers", {"query": "neural network field theory"})
+    finally:
+        bridge._session = None
+
+    assert len(log) == 1
+    assert result.isError is True
+    assert "503" in result.content[0].text
