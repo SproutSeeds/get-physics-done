@@ -239,7 +239,7 @@ _PUBLIC_DESCRIPTOR_METADATA: dict[str, dict[str, object]] = {
             "Optional arXiv bridge for arxiv-mcp-server. Advertises the baseline upstream tools "
             f"{', '.join(_ARXIV_UPSTREAM_CAPABILITIES)}, forwards only tools exposed "
             "by the live upstream server, and adds GPD download_source for raw source archives, "
-            "recent_papers for verified new arXiv listings and paper_citations for references and citing works."
+            "recent_papers for verified new paper listings from arXiv, Zenodo and OpenAlex and paper_citations for references and citing works."
         ),
         "capability_surface": "baseline_dynamic_upstream",
         "dynamic_upstream_capabilities": True,

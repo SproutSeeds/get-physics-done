@@ -93,6 +93,7 @@ _EXPECTED_OPTIONAL_IMPORT_LOCATIONS = {
         "src/gpd/mcp/servers/_arxiv_ar5iv.py",
         "src/gpd/mcp/servers/_arxiv_citations.py",
         "src/gpd/mcp/servers/_arxiv_gcs.py",
+        "src/gpd/mcp/servers/_recent_sources.py",
         "src/gpd/mcp/servers/arxiv_translators.py",
     },
     "pypdf": {"src/gpd/core/artifact_text.py", "src/gpd/mcp/paper/compiler.py"},

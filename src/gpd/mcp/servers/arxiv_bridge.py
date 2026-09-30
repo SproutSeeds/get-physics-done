@@ -36,6 +36,7 @@ from gpd.mcp.servers import (
     _arxiv_gcs,
     _arxiv_retry,
     _arxiv_token_bucket,
+    _recent_sources,
     arxiv_translators,
     mutating_tool_annotations,
     read_only_tool_annotations,
@@ -145,9 +146,18 @@ _RECENT_PAPERS_SCHEMA = {
         "categories": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Optional arXiv categories, for example [\"hep-th\", \"quant-ph\"].",
+            "description": "Optional arXiv categories, for example [\"hep-th\", \"quant-ph\"]; they filter arXiv results only.",
         },
         "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+        "sources": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["arxiv", "zenodo", "openalex"]},
+            "description": (
+                "Where to look: arxiv, zenodo (preprints posted there, often by authors without arXiv access) "
+                "and openalex (journals and repositories other than arXiv). Default: all three when a query is "
+                "given, arxiv alone for a category listing."
+            ),
+        },
     },
     "additionalProperties": False,
 }
@@ -155,10 +165,11 @@ _RECENT_PAPERS_SCHEMA = {
 _RECENT_PAPERS_TOOL = types.Tool(
     name=RECENT_PAPERS_TOOL_NAME,
     description=(
-        "List the newest arXiv papers on a topic, in categories, or both, newest first, straight from "
-        "arXiv's own listing (search_papers draws on OpenAlex, which adds new papers about five days "
-        "after submission). Every returned paper is checked: its first version was submitted inside "
-        "the window, it carries a requested category, and the topic appears in its title or abstract "
+        "List the newest papers on a topic, in arXiv categories, or both, newest first: arXiv's own "
+        "listing (search_papers draws on OpenAlex, which adds new papers about five days after "
+        "submission), Zenodo, and journals or repositories other than arXiv through OpenAlex, each "
+        "paper labeled with its source. Every returned paper is checked: its first version was posted "
+        "inside the window, it carries a requested arXiv category, and the topic appears in its title or abstract "
         "(the phrase, all of its words in the title, or all of them close together in the abstract; "
         "arXiv field queries joined by AND, such as au:Witten AND ti:holography, are checked field by "
         "field). Papers that fail a check are dropped and counted, "
@@ -208,11 +219,15 @@ _PAPER_CITATIONS_TOOL = types.Tool(
 _LOCAL_TOOLS = (_DOWNLOAD_SOURCE_TOOL, _RECENT_PAPERS_TOOL, _PAPER_CITATIONS_TOOL)
 
 RECENT_PAPERS_NOTE = (
-    "Newest first, from arXiv's own listing. Each paper passed every check: its first version was "
-    "submitted inside the window, it carries a requested category, and the query matched as its "
-    "match field says. arXiv adds new submissions at its evening announcement, Sunday through "
-    "Thursday US Eastern time, so a one-day window can be empty."
+    "Newest first, from arXiv's own listing and, when requested, Zenodo and OpenAlex. Each paper passed "
+    "every check: its first version was posted inside the window (arXiv first version, Zenodo first "
+    "upload, OpenAlex publication date), it carries a requested arXiv category, and the query matched as "
+    "its match field says. arXiv adds new submissions at its evening announcement, Sunday through "
+    "Thursday US Eastern time; OpenAlex adds works a few days late. Zenodo uploads are not peer reviewed. "
+    "Sources take turns filling the list, so a busy one cannot crowd out the others, and a title that "
+    "appears in several sources is listed once (arXiv first)."
 )
+RECENT_SOURCES = ("arxiv", "zenodo", "openalex")
 UNCHECKED_SYNTAX = "arXiv query syntax, not rechecked"
 CATEGORY_LISTING = "category listing"
 
@@ -523,8 +538,8 @@ class ArxivBridge:
         return _merge_papers(papers, extra or [], requested)
 
     async def _call_recent_papers(self, arguments: dict[str, object]) -> types.CallToolResult:
-        """Newest arXiv papers on a topic or in categories, each checked before it is returned."""
-        extra = sorted(set(arguments) - {"query", "days", "categories", "max_results"})
+        """Newest papers on a topic or in arXiv categories, from arXiv, Zenodo and OpenAlex, each checked."""
+        extra = sorted(set(arguments) - {"query", "days", "categories", "max_results", "sources"})
         if extra:
             return _tool_error(f"recent_papers got unsupported arguments: {', '.join(extra)}")
         query = arguments.get("query", "")
@@ -541,10 +556,80 @@ class ArxivBridge:
         categories = [c.strip() for c in categories or []]
         if not query and not categories:
             return _tool_error("recent_papers needs a query, categories, or both")
+        sources = arguments.get("sources")
+        if sources is not None and (
+            not isinstance(sources, list)
+            or not sources
+            or not all(isinstance(s, str) and s.strip().lower() in RECENT_SOURCES for s in sources)
+        ):
+            return _tool_error("sources must be a non-empty list drawn from arxiv, zenodo and openalex")
+        requested = list(dict.fromkeys(s.strip().lower() for s in sources)) if sources else (
+            list(RECENT_SOURCES) if query else ["arxiv"]
+        )
+        others = [s for s in requested if s != "arxiv"]
+        notes = []
+        if others and self.config.backend == "arxiv-only":
+            if "arxiv" not in requested:
+                return _tool_error("the arxiv-only backend searches arXiv only")
+            notes.append("The arxiv-only backend searched arXiv only.")
+            others = []
+        if others and not query:
+            if "arxiv" not in requested:
+                return _tool_error("Zenodo and OpenAlex need a query")
+            others = []
+        if others and _is_arxiv_syntax(query):
+            if "arxiv" not in requested:
+                return _tool_error("Zenodo and OpenAlex take plain words or quoted phrases, not arXiv field syntax")
+            notes.append("Zenodo and OpenAlex take plain words or quoted phrases, so this query searched arXiv only.")
+            others = []
+
         days = _bounded_int(arguments.get("days"), default=7, low=1, high=60)
         limit = _bounded_int(arguments.get("max_results"), default=20, low=1, high=50)
         today = datetime.now(UTC).date()
         start = today - timedelta(days=days)
+        per_source: dict[str, list[dict[str, object]]] = {}
+        stats: dict[str, dict[str, object]] = {}
+        incomplete = None
+        if "arxiv" in requested:
+            per_source["arXiv"], stats["arXiv"], incomplete = await self._recent_from_arxiv(
+                query, categories, start, today, limit
+            )
+            if "error" in stats["arXiv"] and not others:
+                return _tool_error(str(stats["arXiv"]["error"]))
+        searches = _other_source_searches(query) if others else []
+        for source in others:
+            name = _recent_sources.ZENODO if source == "zenodo" else _recent_sources.OPENALEX
+            per_source[name], stats[name] = await self._recent_from_other(
+                source, searches, query, start, skip_zenodo="zenodo" in others
+            )
+        if stats and all("error" in s for s in stats.values()):
+            return _tool_error("; ".join(f"{name}: {s['error']}" for name, s in stats.items()))
+        found = _drop_repeated_titles(per_source, stats)
+        kept = _share_limit(found, limit)
+        body: dict[str, object] = {
+            "query": query,
+            "categories": categories,
+            "window": {"from": start.isoformat(), "to": today.isoformat(), "days": days},
+            "total_results": len(kept),
+            "total_passing": sum(len(papers) for papers in found.values()),
+            "checked": sum(int(s.get("checked", 0)) for s in stats.values()),
+            "dropped_outside_window": sum(int(s.get("dropped_outside_window", 0)) for s in stats.values()),
+            "dropped_category_mismatch": sum(int(s.get("dropped_category_mismatch", 0)) for s in stats.values()),
+            "dropped_topic_not_found": sum(int(s.get("dropped_topic_not_found", 0)) for s in stats.values()),
+            "sources": stats,
+            "note": RECENT_PAPERS_NOTE,
+            "papers": kept,
+        }
+        if notes:
+            body["notes"] = notes
+        if incomplete:
+            body["incomplete"] = incomplete
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(body, indent=2))])
+
+    async def _recent_from_arxiv(
+        self, query: str, categories: list[str], start: date, today: date, limit: int
+    ) -> tuple[list[dict[str, object]], dict[str, object], str | None]:
+        """Checked arXiv papers, their counts, and a note when the second search failed."""
         base: dict[str, object] = {
             "date_from": start.isoformat(),
             # arXiv dates are UTC; an explicit end keeps the window from
@@ -556,12 +641,11 @@ class ArxivBridge:
         }
         if categories:
             base["categories"] = categories
-
         phrase = _plain_phrase({"query": query}) if query else None
         searches = [phrase, " AND ".join(dict.fromkeys(_content_words(query)))] if phrase else [query]
         kept: list[dict[str, object]] = []
         seen: set[str] = set()
-        checked = outside_window = off_category = off_topic = 0
+        counts = {"checked": 0, "dropped_outside_window": 0, "dropped_category_mismatch": 0, "dropped_topic_not_found": 0}
         incomplete = None
         for index, search in enumerate(searches):
             result = await self._call_throttled("search_papers", {**base, "query": search})
@@ -569,45 +653,65 @@ class ArxivBridge:
             if found is None:
                 message = _error_text(result, "arXiv search failed")
                 if index == 0:
-                    return _tool_error(message)
-                incomplete = f"The all-words search failed ({message}); papers matching only it may be missing."
+                    return [], {**counts, "kept": 0, "error": message}, None
+                incomplete = f"The all-words arXiv search failed ({message}); papers matching only it may be missing."
                 break
             for paper in found:
                 key = _paper_key(paper)
                 if not isinstance(paper, dict) or not key or key in seen:
                     continue
                 seen.add(key)
-                checked += 1
+                counts["checked"] += 1
                 published = _published_day(paper)
                 if published is None or published < start:
-                    outside_window += 1
+                    counts["dropped_outside_window"] += 1
                     continue
                 if categories and not _in_categories(paper, categories):
-                    off_category += 1
+                    counts["dropped_category_mismatch"] += 1
                     continue
                 match = _topic_match(query, paper) if query else CATEGORY_LISTING
                 if match is None:
-                    off_topic += 1
+                    counts["dropped_topic_not_found"] += 1
                     continue
-                kept.append({**paper, "match": match})
+                kept.append({**paper, "source": "arXiv", "match": match})
             if len(kept) >= limit:
                 break
-        kept.sort(key=lambda paper: str(paper.get("published") or ""), reverse=True)
-        body: dict[str, object] = {
-            "query": query,
-            "categories": categories,
-            "window": {"from": start.isoformat(), "to": today.isoformat(), "days": days},
-            "total_results": min(len(kept), limit),
-            "checked": checked,
-            "dropped_outside_window": outside_window,
-            "dropped_category_mismatch": off_category,
-            "dropped_topic_not_found": off_topic,
-            "note": RECENT_PAPERS_NOTE,
-            "papers": kept[:limit],
-        }
-        if incomplete:
-            body["incomplete"] = incomplete
-        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(body, indent=2))])
+        return kept, {**counts, "kept": len(kept)}, incomplete
+
+    async def _recent_from_other(
+        self, source: str, searches: list[str], query: str, start: date, *, skip_zenodo: bool
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Checked papers from Zenodo or OpenAlex, and their counts (with ``error`` when a search failed)."""
+        kept: list[dict[str, object]] = []
+        seen: set[str] = set()
+        counts: dict[str, object] = {"checked": 0, "dropped_outside_window": 0, "dropped_topic_not_found": 0}
+        for search in searches:
+            if source == "zenodo":
+                found, error = await asyncio.to_thread(_recent_sources.zenodo_recent, search, start)
+            else:
+                found, error = await asyncio.to_thread(
+                    _recent_sources.openalex_recent, search, start, skip_zenodo=skip_zenodo
+                )
+            if error:
+                counts["error"] = error
+                break
+            for paper in found:
+                key = str(paper.get("id") or "").lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                counts["checked"] = int(counts["checked"]) + 1
+                published = _published_day(paper)
+                if published is None or published < start:
+                    counts["dropped_outside_window"] = int(counts["dropped_outside_window"]) + 1
+                    continue
+                match = _topic_match(query, paper)
+                if match is None:
+                    counts["dropped_topic_not_found"] = int(counts["dropped_topic_not_found"]) + 1
+                    continue
+                kept.append({**paper, "match": match})
+        counts["kept"] = len(kept)
+        return kept, counts
 
     async def _arxiv_phrase_search(
         self, args: dict[str, object]
@@ -1269,6 +1373,68 @@ def _topic_match(query: str, paper: dict[str, object]) -> str | None:
     if all(_has_run(title, run) or _has_run(abstract, run) for run in phrases):
         return "phrase in abstract"
     return None
+
+
+def _drop_repeated_titles(
+    per_source: dict[str, list[dict[str, object]]], stats: dict[str, dict[str, object]]
+) -> dict[str, list[dict[str, object]]]:
+    """Keep one copy of each title across sources, preferring arXiv, then Zenodo, then OpenAlex.
+
+    The same work often appears twice: posted to both arXiv and Zenodo, or
+    mirrored from Figshare or Zenodo into OpenAlex, sometimes once per
+    version. Dropped copies are counted under ``dropped_duplicate``.
+    """
+    seen: set[str] = set()
+    out: dict[str, list[dict[str, object]]] = {}
+    for name, papers in per_source.items():
+        out[name] = []
+        for paper in sorted(papers, key=lambda p: str(p.get("published") or "")):
+            key = _normalized(str(paper.get("title") or ""))
+            if key and key in seen:
+                stats[name]["dropped_duplicate"] = int(stats[name].get("dropped_duplicate", 0)) + 1
+                stats[name]["kept"] = int(stats[name].get("kept", 0)) - 1
+                continue
+            seen.add(key)
+            out[name].append(paper)
+        out[name].sort(key=lambda p: str(p.get("published") or ""), reverse=True)
+    return out
+
+
+def _share_limit(per_source: dict[str, list[dict[str, object]]], limit: int) -> list[dict[str, object]]:
+    """At most ``limit`` papers, newest first, taking each source's newest in turn.
+
+    A busy source (Zenodo receives many unreviewed uploads) would otherwise
+    fill every slot and push out newer-than-nothing results from arXiv or
+    journals.
+    """
+    queues = [list(papers) for papers in per_source.values()]
+    chosen: list[dict[str, object]] = []
+    while len(chosen) < limit and any(queues):
+        for queue in queues:
+            if queue and len(chosen) < limit:
+                chosen.append(queue.pop(0))
+    chosen.sort(key=lambda paper: str(paper.get("published") or ""), reverse=True)
+    return chosen
+
+
+def _is_arxiv_syntax(query: str) -> bool:
+    return bool(_ARXIV_ONLY_QUERY_SYNTAX.search(query) or re.search(r"\b(?:AND|OR|NOT)\b|[()]", query))
+
+
+def _other_source_searches(query: str) -> list[str]:
+    """Zenodo and OpenAlex search strings for a plain query.
+
+    Both treat bare words as OR, so terms are joined with AND: a plain
+    multi-word query searches its exact phrase, then all of its words;
+    quoted phrases and other words are searched together. Words are
+    normalized (case, accents, punctuation), which both services ignore.
+    """
+    phrases = [" ".join(_normalized(p).split()) for p in re.findall(r'"([^"]*)"', query) if _normalized(p)]
+    words = list(dict.fromkeys(_content_words(re.sub(r'"[^"]*"', " ", query))))
+    if not phrases and len(words) > 1:
+        return [f'"{_normalized(query)}"', " AND ".join(words)]
+    parts = [f'"{phrase}"' for phrase in phrases] + words
+    return [" AND ".join(parts)] if parts else []
 
 
 def _plain_phrase(args: dict[str, object]) -> str | None:

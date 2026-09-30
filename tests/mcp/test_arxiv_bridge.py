@@ -1453,6 +1453,15 @@ async def test_search_papers_top_up_keeps_frequently_cited(
     assert body["frequently_cited_note"] == "note"
 
 
+@pytest.fixture(autouse=True)
+def _no_other_recent_sources(monkeypatch: pytest.MonkeyPatch):
+    """recent_papers also asks Zenodo and OpenAlex; unit tests must not reach them."""
+    from gpd.mcp.servers import _recent_sources
+
+    monkeypatch.setattr(_recent_sources, "zenodo_recent", lambda search, start: ([], None))
+    monkeypatch.setattr(_recent_sources, "openalex_recent", lambda search, start, skip_zenodo: ([], None))
+
+
 def _dated_paper(paper_id, title, abstract, published, *, authors=("A. Author",), categories=("hep-th",)):
     return {"id": paper_id, "title": title, "authors": list(authors), "abstract": "[EXTERNAL CONTENT] " + abstract,
             "categories": list(categories), "published": published, "url": f"https://arxiv.org/pdf/{paper_id}",
@@ -1590,7 +1599,9 @@ async def test_recent_papers_reports_a_failed_second_search(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_recent_papers_surfaces_a_first_search_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, _ = await _recent(monkeypatch, {"query": "sphaleron"}, [("Error: arXiv API HTTP error - 503", True)])
+    result, _ = await _recent(
+        monkeypatch, {"query": "sphaleron", "sources": ["arxiv"]}, [("Error: arXiv API HTTP error - 503", True)]
+    )
     assert result.isError is True
     text = result.content[0].text
     assert "503" in text and not text.startswith("Error: Error")
@@ -1601,7 +1612,9 @@ async def test_recent_papers_surfaces_a_first_search_error(monkeypatch: pytest.M
     "arguments, message",
     [({"query": ""}, "query, categories"), ({}, "query, categories"), ({"query": "&#"}, "query, categories"),
      ({"query": "x", "limit": 3}, "unsupported arguments"), ({"query": "x", "categories": "hep-th"}, "categories"),
-     ({"query": 3}, "query must be a string")],
+     ({"query": 3}, "query must be a string"), ({"query": "x", "sources": []}, "sources must be"),
+     ({"query": "x", "sources": ["inspire"]}, "sources must be"), ({"categories": ["hep-th"], "sources": ["zenodo"]}, "need a query"),
+     ({"query": "au:Witten", "sources": ["zenodo"]}, "not arXiv field syntax")],
 )
 async def test_recent_papers_rejects_bad_arguments(monkeypatch: pytest.MonkeyPatch, arguments, message) -> None:
     result, log = await _recent(monkeypatch, arguments, [])
@@ -1726,3 +1739,145 @@ async def test_rejected_cached_conversion_failure_is_removed_before_upstream_fal
     assert not stub.exists()
     assert [call[0] for call in log] == [tool]
     assert "Fatal error" not in result.content[0].text
+
+
+def _other_paper(pid, title, abstract, published, source):
+    return {"id": pid, "title": title, "authors": ["B. Author"], "abstract": "[EXTERNAL CONTENT] " + abstract,
+            "categories": [], "published": published, "url": f"https://doi.org/{pid}", "source": source, "type": "preprint"}
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_merges_checked_zenodo_and_openalex_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zenodo and OpenAlex papers pass the same window and topic checks as arXiv
+    papers, carry their source, and are merged newest first."""
+    import json as _json
+
+    from gpd.mcp.servers import _recent_sources
+
+    calls = []
+
+    def fake_zenodo(search, start):
+        calls.append(("zenodo", search))
+        return ([
+            _other_paper("10.5281/zenodo.1", "Reflection positivity for networks", "We study it.", _days_ago(0, "03:00:00"), "Zenodo"),
+            _other_paper("10.5281/zenodo.2", "Old upload", "Reflection positivity again.", _days_ago(30), "Zenodo"),
+            _other_paper("10.5281/zenodo.3", "Unrelated", "Mass gap claims.", _days_ago(1), "Zenodo"),
+        ], None)
+
+    def fake_openalex(search, start, skip_zenodo):
+        calls.append(("openalex", search, skip_zenodo))
+        return ([_other_paper("10.1103/x", "Journal result", "A proof of reflection positivity.", _days_ago(2), "Physical Review D")], None)
+
+    monkeypatch.setattr(_recent_sources, "zenodo_recent", fake_zenodo)
+    monkeypatch.setattr(_recent_sources, "openalex_recent", fake_openalex)
+    arxiv_hits = {"total_results": 1, "papers": [
+        _dated_paper("2609.00010", "Reflection positivity at finite width", "Text.", _days_ago(1))]}
+    empty = _json.dumps({"total_results": 0, "papers": []})
+    result, log = await _recent(monkeypatch, {"query": "reflection positivity", "days": 7},
+                                [(_json.dumps(arxiv_hits), False), (empty, False)])
+
+    body = _json.loads(result.content[0].text)
+    assert [(p["id"], p["source"], p["match"]) for p in body["papers"]] == [
+        ("10.5281/zenodo.1", "Zenodo", "phrase in title"),
+        ("2609.00010", "arXiv", "phrase in title"),
+        ("10.1103/x", "Physical Review D", "phrase in abstract"),
+    ]
+    assert body["sources"]["Zenodo"] == {"checked": 3, "dropped_outside_window": 1, "dropped_topic_not_found": 1, "kept": 1}
+    assert body["sources"]["OpenAlex"]["kept"] == 1 and body["sources"]["arXiv"]["kept"] == 1
+    assert (body["checked"], body["dropped_outside_window"], body["dropped_topic_not_found"]) == (5, 1, 1)
+    assert calls == [("zenodo", '"reflection positivity"'), ("zenodo", "reflection AND positivity"),
+                     ("openalex", '"reflection positivity"', True), ("openalex", "reflection AND positivity", True)]
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_keeps_other_sources_when_arxiv_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    from gpd.mcp.servers import _recent_sources
+
+    monkeypatch.setattr(_recent_sources, "zenodo_recent", lambda search, start: (
+        [_other_paper("10.5281/zenodo.9", "Sphaleron rates", "x", _days_ago(0, "03:00:00"), "Zenodo")], None))
+    monkeypatch.setattr(_recent_sources, "openalex_recent",
+                        lambda search, start, skip_zenodo: ([], "OpenAlex search failed (HTTP 429: rate limit or daily budget reached)"))
+    result, _ = await _recent(monkeypatch, {"query": "sphaleron"}, [("Error: arXiv API HTTP error - 503", True)])
+    assert result.isError is False
+    body = _json.loads(result.content[0].text)
+    assert [p["id"] for p in body["papers"]] == ["10.5281/zenodo.9"]
+    assert "503" in body["sources"]["arXiv"]["error"] and "429" in body["sources"]["OpenAlex"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_fails_only_when_every_source_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gpd.mcp.servers import _recent_sources
+
+    monkeypatch.setattr(_recent_sources, "zenodo_recent", lambda search, start: ([], "Zenodo search failed (HTTP 503)"))
+    monkeypatch.setattr(_recent_sources, "openalex_recent", lambda search, start, skip_zenodo: ([], "OpenAlex search failed (network error)"))
+    result, _ = await _recent(monkeypatch, {"query": "sphaleron"}, [("Error: arXiv API HTTP error - 503", True)])
+    assert result.isError is True
+    assert all(name in result.content[0].text for name in ("arXiv", "Zenodo", "OpenAlex"))
+
+
+@pytest.mark.asyncio
+async def test_recent_papers_limits_arxiv_syntax_listings_and_arxiv_only_backend_to_arxiv(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    from gpd.mcp.servers import _recent_sources
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("other sources must not be searched")
+
+    monkeypatch.setattr(_recent_sources, "zenodo_recent", refuse)
+    monkeypatch.setattr(_recent_sources, "openalex_recent", refuse)
+    empty = _json.dumps({"total_results": 0, "papers": []})
+    result, _ = await _recent(monkeypatch, {"query": "au:Halverson"}, [(empty, False)])
+    assert "arXiv only" in _json.loads(result.content[0].text)["notes"][0]
+    result, _ = await _recent(monkeypatch, {"query": "sphaleron"}, [(empty, False)], backend="arxiv-only")
+    assert "arxiv-only" in _json.loads(result.content[0].text)["notes"][0]
+    result, _ = await _recent(monkeypatch, {"categories": ["hep-th"]}, [(empty, False)])
+    assert list(_json.loads(result.content[0].text)["sources"]) == ["arXiv"]
+    result, _ = await _recent(monkeypatch, {"query": "sphaleron", "sources": ["zenodo"]}, [], backend="arxiv-only")
+    assert result.isError is True and "arxiv-only" in result.content[0].text
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("reflection positivity", ['"reflection positivity"', "reflection AND positivity"]),
+        ("Rényi entropy", ['"renyi entropy"', "renyi AND entropy"]),
+        ('"neural network" gaussian', ['"neural network" AND gaussian']),
+        ("sphaleron", ["sphaleron"]),
+    ],
+)
+def test_other_source_searches(query, expected) -> None:
+    from gpd.mcp.servers.arxiv_bridge import _other_source_searches
+
+    assert _other_source_searches(query) == expected
+
+
+def test_share_limit_keeps_every_source_represented() -> None:
+    from gpd.mcp.servers.arxiv_bridge import _share_limit
+
+    zenodo = [{"id": f"z{i}", "published": f"2026-09-2{9 - i}"} for i in range(8)]
+    arxiv = [{"id": "a1", "published": "2026-09-03"}]
+    openalex = [{"id": "o1", "published": "2026-09-10"}, {"id": "o2", "published": "2026-09-09"}]
+    chosen = _share_limit({"arXiv": arxiv, "Zenodo": zenodo, "OpenAlex": openalex}, 5)
+    assert [p["id"] for p in chosen] == ["z0", "z1", "o1", "o2", "a1"]
+
+
+def test_repeated_titles_keep_the_arxiv_copy_and_are_counted() -> None:
+    from gpd.mcp.servers.arxiv_bridge import _drop_repeated_titles
+
+    per_source = {
+        "arXiv": [{"id": "2609.1", "title": "A Result", "published": "2026-09-20"}],
+        "Zenodo": [{"id": "10.5281/zenodo.1", "title": "A result", "published": "2026-09-21"},
+                   {"id": "10.5281/zenodo.2", "title": "Another", "published": "2026-09-22"}],
+        "OpenAlex": [{"id": "10.6084/f.v1", "title": "Another", "published": "2026-09-22"},
+                     {"id": "10.6084/f.v2", "title": "Another", "published": "2026-09-23"}],
+    }
+    stats = {"arXiv": {"kept": 1}, "Zenodo": {"kept": 2}, "OpenAlex": {"kept": 2}}
+    out = _drop_repeated_titles(per_source, stats)
+    assert [p["id"] for p in out["arXiv"]] == ["2609.1"]
+    assert [p["id"] for p in out["Zenodo"]] == ["10.5281/zenodo.2"]
+    assert out["OpenAlex"] == []
+    assert stats["Zenodo"] == {"kept": 1, "dropped_duplicate": 1}
+    assert stats["OpenAlex"] == {"kept": 0, "dropped_duplicate": 2}
